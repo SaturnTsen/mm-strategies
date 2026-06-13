@@ -1,0 +1,27 @@
+[package]
+name = "hl-market-data-v1"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+log = "0.4"
+nautilus-common = { version = "0.54.0", features = ["live"] }
+nautilus-core = "0.54.0"
+nautilus-hyperliquid = "0.54.0"
+nautilus-live = "0.54.0"
+nautilus-model = { version = "0.54.0", features = ["high-precision"] }
+rust_decimal = "1.39"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[[bin]]
+name = "live-recorder"
+path = "src/bin/live_recorder.rs"
+
+[[bin]]
+name = "historical-ingest"
+path = "src/bin/historical_ingest.rs"

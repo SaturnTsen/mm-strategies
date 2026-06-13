@@ -1,0 +1,17 @@
+data/
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+
+Cargo.lock
+AGENTS.md
+
+.vscode/
+
+data/
+target/
+plans/
+reports/
+nautilus-trader-docs/
