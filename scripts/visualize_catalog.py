@@ -3,6 +3,7 @@ import argparse
 import html
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -19,6 +20,7 @@ ACTION_DELETE = 3
 ACTION_CLEAR = 4
 SIDE_BUY = 1
 SIDE_SELL = 2
+DATA_TYPES = ("order_book_deltas", "quote_tick", "trade_tick")
 
 
 def read_catalog_type(catalog: Path, data_type: str, instrument: str) -> pd.DataFrame:
@@ -36,6 +38,24 @@ def read_catalog_type(catalog: Path, data_type: str, instrument: str) -> pd.Data
         frames.append(frame)
 
     return pd.concat(frames, ignore_index=True)
+
+
+def discover_instruments(catalog: Path) -> list[str]:
+    data_root = catalog / "data"
+    if not data_root.exists():
+        raise FileNotFoundError(f"Catalog data directory does not exist: {data_root}")
+
+    instrument_sets = []
+    for data_type in DATA_TYPES:
+        directory = data_root / data_type
+        if not directory.exists():
+            raise FileNotFoundError(f"Catalog data type directory does not exist: {directory}")
+        instrument_sets.append({path.name for path in directory.iterdir() if path.is_dir()})
+
+    instruments = sorted(set.intersection(*instrument_sets))
+    if not instruments:
+        raise FileNotFoundError(f"No instruments with all required data types: {', '.join(DATA_TYPES)}")
+    return instruments
 
 
 def fixed_to_float(value: bytes, signed: bool) -> float:
@@ -61,7 +81,7 @@ def load_deltas(catalog: Path, instrument: str) -> pd.DataFrame:
 
 
 def load_quotes(catalog: Path, instrument: str) -> pd.DataFrame:
-    quotes = read_catalog_type(catalog, "quotes", instrument)
+    quotes = read_catalog_type(catalog, "quote_tick", instrument)
     quotes["bid_price_f"] = decode_fixed_column(quotes["bid_price"], signed=True)
     quotes["ask_price_f"] = decode_fixed_column(quotes["ask_price"], signed=True)
     quotes["bid_size_f"] = decode_fixed_column(quotes["bid_size"], signed=False)
@@ -74,7 +94,7 @@ def load_quotes(catalog: Path, instrument: str) -> pd.DataFrame:
 
 
 def load_trades(catalog: Path, instrument: str) -> pd.DataFrame:
-    trades = read_catalog_type(catalog, "trades", instrument)
+    trades = read_catalog_type(catalog, "trade_tick", instrument)
     trades["price_f"] = decode_fixed_column(trades["price"], signed=True)
     trades["size_f"] = decode_fixed_column(trades["size"], signed=False)
     trades = add_datetime(trades)
@@ -225,7 +245,7 @@ def save_trades_quotes(quotes: pd.DataFrame, trades: pd.DataFrame, path: Path) -
     plt.close(fig)
 
 
-def write_html(out_dir: Path, instrument: str, summary: dict[str, object]) -> None:
+def write_report_html(out_dir: Path, instrument: str, summary: dict[str, object]) -> None:
     rows = "\n".join(
         f"<tr><th>{html.escape(str(key))}</th><td>{html.escape(str(value))}</td></tr>"
         for key, value in summary.items()
@@ -261,26 +281,49 @@ def write_html(out_dir: Path, instrument: str, summary: dict[str, object]) -> No
     (out_dir / "index.html").write_text(body, encoding="utf-8")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--catalog", type=Path, default=Path("data/catalog"))
-    parser.add_argument("--instrument", default="BTC-USD-PERP.HYPERLIQUID")
-    parser.add_argument("--out-dir", type=Path, default=Path("reports/catalog_visualization"))
-    args = parser.parse_args()
+def write_index_html(out_dir: Path, reports: list[tuple[str, Path]]) -> None:
+    links = "\n".join(
+        f'<li><a href="{html.escape(path.name)}/index.html">{html.escape(instrument)}</a></li>'
+        for instrument, path in reports
+    )
+    body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Catalog Reports</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 32px; color: #222; }}
+    h1 {{ font-size: 24px; }}
+    li {{ margin: 8px 0; }}
+  </style>
+</head>
+<body>
+  <h1>Catalog Reports</h1>
+  <ul>{links}</ul>
+</body>
+</html>
+"""
+    (out_dir / "index.html").write_text(body, encoding="utf-8")
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    deltas = load_deltas(args.catalog, args.instrument)
-    quotes = load_quotes(args.catalog, args.instrument)
-    trades = load_trades(args.catalog, args.instrument)
+def report_directory_name(instrument: str) -> str:
+    return quote(instrument.replace("/", "_"), safe=".-_")
+
+
+def build_report(catalog: Path, instrument: str, out_dir: Path) -> dict[str, object]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    deltas = load_deltas(catalog, instrument)
+    quotes = load_quotes(catalog, instrument)
+    trades = load_trades(catalog, instrument)
     top, depth = reconstruct_top_of_book(deltas)
 
-    top.to_csv(args.out_dir / "reconstructed_top_of_book.csv", index=False)
-    depth.sort_values(["side", "price"]).to_csv(args.out_dir / "last_depth_snapshot.csv", index=False)
+    top.to_csv(out_dir / "reconstructed_top_of_book.csv", index=False)
+    depth.sort_values(["side", "price"]).to_csv(out_dir / "last_depth_snapshot.csv", index=False)
 
     summary = {
-        "catalog": args.catalog,
-        "instrument": args.instrument,
+        "catalog": catalog,
+        "instrument": instrument,
         "deltas": len(deltas),
         "quotes": len(quotes),
         "trades": len(trades),
@@ -291,15 +334,36 @@ def main() -> None:
         "last ask": top["best_ask"].iloc[-1],
         "last spread bps": round(top["spread_bps"].iloc[-1], 4),
     }
-    pd.DataFrame([summary]).to_csv(args.out_dir / "summary.csv", index=False)
+    pd.DataFrame([summary]).to_csv(out_dir / "summary.csv", index=False)
 
-    save_top_of_book(top, args.out_dir / "top_of_book.png")
-    save_spread_imbalance(top, args.out_dir / "spread_imbalance.png")
-    save_depth_snapshot(depth, args.out_dir / "depth_snapshot.png")
-    save_trades_quotes(quotes, trades, args.out_dir / "trades_quotes.png")
-    write_html(args.out_dir, args.instrument, summary)
+    save_top_of_book(top, out_dir / "top_of_book.png")
+    save_spread_imbalance(top, out_dir / "spread_imbalance.png")
+    save_depth_snapshot(depth, out_dir / "depth_snapshot.png")
+    save_trades_quotes(quotes, trades, out_dir / "trades_quotes.png")
+    write_report_html(out_dir, instrument, summary)
+    return summary
 
-    print(f"Wrote report to {args.out_dir / 'index.html'}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--catalog", type=Path, default=Path("catalog"))
+    parser.add_argument("-i", "--instrument", action="append", default=None)
+    parser.add_argument("--out-dir", type=Path, default=Path("reports/catalog_visualization"))
+    args = parser.parse_args()
+
+    catalog = args.catalog.expanduser()
+    instruments = args.instrument if args.instrument is not None else discover_instruments(catalog)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    reports = []
+    for instrument in instruments:
+        report_dir = args.out_dir / report_directory_name(instrument)
+        build_report(catalog, instrument, report_dir)
+        reports.append((instrument, report_dir))
+        print(f"Wrote {instrument} report to {report_dir / 'index.html'}")
+
+    write_index_html(args.out_dir, reports)
+    print(f"Wrote report index to {args.out_dir / 'index.html'}")
 
 
 if __name__ == "__main__":
