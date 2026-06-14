@@ -10,160 +10,13 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
-import pyarrow.parquet as pq
 
-
-FIXED_SCALAR = 10**16
-ACTION_ADD = 1
-ACTION_UPDATE = 2
-ACTION_DELETE = 3
-ACTION_CLEAR = 4
-SIDE_BUY = 1
-SIDE_SELL = 2
-DATA_TYPES = ("order_book_deltas", "quote_tick", "trade_tick")
-
-
-def read_catalog_type(catalog: Path, data_type: str, instrument: str) -> pd.DataFrame:
-    directory = catalog / "data" / data_type / instrument
-    files = sorted(directory.glob("*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No parquet files found under {directory}")
-
-    frames = []
-    for file_index, path in enumerate(files):
-        table = pq.read_table(path)
-        frame = table.to_pandas()
-        frame["_file_index"] = file_index
-        frame["_row"] = range(len(frame))
-        frames.append(frame)
-
-    return pd.concat(frames, ignore_index=True)
-
-
-def discover_instruments(catalog: Path) -> list[str]:
-    data_root = catalog / "data"
-    if not data_root.exists():
-        raise FileNotFoundError(f"Catalog data directory does not exist: {data_root}")
-
-    instrument_sets = []
-    for data_type in DATA_TYPES:
-        directory = data_root / data_type
-        if not directory.exists():
-            raise FileNotFoundError(f"Catalog data type directory does not exist: {directory}")
-        instrument_sets.append({path.name for path in directory.iterdir() if path.is_dir()})
-
-    instruments = sorted(set.intersection(*instrument_sets))
-    if not instruments:
-        raise FileNotFoundError(f"No instruments with all required data types: {', '.join(DATA_TYPES)}")
-    return instruments
-
-
-def fixed_to_float(value: bytes, signed: bool) -> float:
-    return int.from_bytes(value, "little", signed=signed) / FIXED_SCALAR
-
-
-def decode_fixed_column(series: pd.Series, signed: bool) -> pd.Series:
-    return series.map(lambda value: fixed_to_float(value, signed=signed))
-
-
-def add_datetime(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = frame.copy()
-    frame["dt"] = pd.to_datetime(frame["ts_event"], unit="ns", utc=True)
-    return frame
-
-
-def load_deltas(catalog: Path, instrument: str) -> pd.DataFrame:
-    deltas = read_catalog_type(catalog, "order_book_deltas", instrument)
-    deltas["price_f"] = decode_fixed_column(deltas["price"], signed=True)
-    deltas["size_f"] = decode_fixed_column(deltas["size"], signed=False)
-    deltas = add_datetime(deltas)
-    return deltas.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
-
-
-def load_quotes(catalog: Path, instrument: str) -> pd.DataFrame:
-    quotes = read_catalog_type(catalog, "quote_tick", instrument)
-    quotes["bid_price_f"] = decode_fixed_column(quotes["bid_price"], signed=True)
-    quotes["ask_price_f"] = decode_fixed_column(quotes["ask_price"], signed=True)
-    quotes["bid_size_f"] = decode_fixed_column(quotes["bid_size"], signed=False)
-    quotes["ask_size_f"] = decode_fixed_column(quotes["ask_size"], signed=False)
-    quotes["mid_f"] = (quotes["bid_price_f"] + quotes["ask_price_f"]) / 2.0
-    quotes["spread_f"] = quotes["ask_price_f"] - quotes["bid_price_f"]
-    quotes["spread_bps"] = quotes["spread_f"] / quotes["mid_f"] * 10_000.0
-    quotes = add_datetime(quotes)
-    return quotes.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
-
-
-def load_trades(catalog: Path, instrument: str) -> pd.DataFrame:
-    trades = read_catalog_type(catalog, "trade_tick", instrument)
-    trades["price_f"] = decode_fixed_column(trades["price"], signed=True)
-    trades["size_f"] = decode_fixed_column(trades["size"], signed=False)
-    trades = add_datetime(trades)
-    return trades.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
-
-
-def reconstruct_top_of_book(deltas: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    bids: dict[float, float] = {}
-    asks: dict[float, float] = {}
-    snapshots = []
-
-    for row in deltas.itertuples(index=False):
-        action = int(row.action)
-        side = int(row.side)
-        price = float(row.price_f)
-        size = float(row.size_f)
-
-        if action == ACTION_CLEAR:
-            bids.clear()
-            asks.clear()
-        elif action in (ACTION_ADD, ACTION_UPDATE):
-            book = bids if side == SIDE_BUY else asks if side == SIDE_SELL else None
-            if book is None:
-                raise ValueError(f"Unexpected side={side} for action={action}")
-            if size <= 0.0:
-                book.pop(price, None)
-            else:
-                book[price] = size
-        elif action == ACTION_DELETE:
-            book = bids if side == SIDE_BUY else asks if side == SIDE_SELL else None
-            if book is None:
-                raise ValueError(f"Unexpected side={side} for delete")
-            book.pop(price, None)
-        else:
-            raise ValueError(f"Unexpected action={action}")
-
-        if bids and asks:
-            best_bid = max(bids)
-            best_ask = min(asks)
-            bid_size = bids[best_bid]
-            ask_size = asks[best_ask]
-            mid = (best_bid + best_ask) / 2.0
-            spread = best_ask - best_bid
-            snapshots.append(
-                {
-                    "dt": row.dt,
-                    "ts_event": row.ts_event,
-                    "ts_init": row.ts_init,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "bid_size": bid_size,
-                    "ask_size": ask_size,
-                    "mid": mid,
-                    "spread": spread,
-                    "spread_bps": spread / mid * 10_000.0,
-                    "top_imbalance": (bid_size - ask_size) / (bid_size + ask_size),
-                    "bid_levels": len(bids),
-                    "ask_levels": len(asks),
-                }
-            )
-
-    if not snapshots:
-        raise ValueError("No valid top-of-book snapshots reconstructed")
-
-    top = pd.DataFrame(snapshots)
-    depth_rows = [{"side": "bid", "price": price, "size": size} for price, size in bids.items()]
-    depth_rows.extend({"side": "ask", "price": price, "size": size} for price, size in asks.items())
-    depth = pd.DataFrame(depth_rows)
-    return top, depth
+from data_utils import discover_instruments
+from data_utils import depth_snapshot_to_long
+from data_utils import depths_to_top
+from data_utils import load_depths
+from data_utils import load_quotes
+from data_utils import load_trades
 
 
 def save_top_of_book(top: pd.DataFrame, path: Path) -> None:
@@ -313,10 +166,11 @@ def report_directory_name(instrument: str) -> str:
 def build_report(catalog: Path, instrument: str, out_dir: Path) -> dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    deltas = load_deltas(catalog, instrument)
+    depths = load_depths(catalog, instrument)
     quotes = load_quotes(catalog, instrument)
     trades = load_trades(catalog, instrument)
-    top, depth = reconstruct_top_of_book(deltas)
+    top = depths_to_top(depths)
+    depth = depth_snapshot_to_long(depths)
 
     top.to_csv(out_dir / "reconstructed_top_of_book.csv", index=False)
     depth.sort_values(["side", "price"]).to_csv(out_dir / "last_depth_snapshot.csv", index=False)
@@ -324,12 +178,12 @@ def build_report(catalog: Path, instrument: str, out_dir: Path) -> dict[str, obj
     summary = {
         "catalog": catalog,
         "instrument": instrument,
-        "deltas": len(deltas),
+        "depth snapshots": len(depths),
         "quotes": len(quotes),
         "trades": len(trades),
         "top snapshots": len(top),
-        "start": min(deltas["dt"].min(), quotes["dt"].min(), trades["dt"].min()),
-        "end": max(deltas["dt"].max(), quotes["dt"].max(), trades["dt"].max()),
+        "start": min(depths["dt"].min(), quotes["dt"].min(), trades["dt"].min()),
+        "end": max(depths["dt"].max(), quotes["dt"].max(), trades["dt"].max()),
         "last bid": top["best_bid"].iloc[-1],
         "last ask": top["best_ask"].iloc[-1],
         "last spread bps": round(top["spread_bps"].iloc[-1], 4),
