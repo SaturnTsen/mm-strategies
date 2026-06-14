@@ -13,5 +13,6 @@ AGENTS.md
 data/
 target/
 plans/
+catalog/
 reports/
 nautilus-trader-docs/
