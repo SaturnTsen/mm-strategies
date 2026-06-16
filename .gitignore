@@ -9,7 +9,8 @@ Cargo.lock
 AGENTS.md
 
 .vscode/
-
+.codex
+.agents
 data/
 target/
 plans/

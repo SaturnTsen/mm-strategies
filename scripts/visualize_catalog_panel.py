@@ -27,7 +27,7 @@ from data_utils import (
     load_depths,
     load_quotes,
     load_trades,
-    segment_from_key,
+    segment_from_key
 )
 
 

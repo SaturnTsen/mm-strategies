@@ -11,6 +11,7 @@ FIXED_SCALAR = 10**16
 DEPTH_LEVELS = 10
 DATA_TYPES = ("order_book_deltas", "quote_tick", "trade_tick")
 RECONSTRUCT_DATA_TYPE = "reconstruct"
+RECONSTRUCT_MATCH_MIN_RATIO = 0.90
 ACTION_ADD = 1
 ACTION_UPDATE = 2
 ACTION_DELETE = 3
@@ -52,8 +53,24 @@ def parse_catalog_file_segment(path: Path) -> CatalogSegment:
     return CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
 
 
+def segment_from_key(segment_key: str) -> CatalogSegment:
+    start_value, end_value = segment_key.split("_", maxsplit=1)
+    return CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
+
+
 def segments_overlap(left: CatalogSegment, right: CatalogSegment) -> bool:
     return left.start <= right.end and right.start <= left.end
+
+
+def segment_overlap_ratio(segment: CatalogSegment, target: CatalogSegment) -> float:
+    target_duration = target.end - target.start
+    if target_duration <= pd.Timedelta(0):
+        raise ValueError(f"Invalid segment duration: {target}")
+    overlap_start = max(segment.start, target.start)
+    overlap_end = min(segment.end, target.end)
+    if overlap_end <= overlap_start:
+        return 0.0
+    return float((overlap_end - overlap_start) / target_duration)
 
 
 def discover_segments(catalog: Path) -> list[CatalogSegment]:
@@ -110,8 +127,7 @@ def _read_catalog_type(catalog: Path, data_type: str, instrument: str, segment_k
     directory = catalog / "data" / data_type / instrument
     files = sorted(directory.glob("*.parquet"))
     if segment_key is not None:
-        start_value, end_value = segment_key.split("_", maxsplit=1)
-        segment = CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
+        segment = segment_from_key(segment_key)
         files = [path for path in files if segments_overlap(parse_catalog_file_segment(path), segment)]
     if not files:
         segment_detail = f" for segment {segment_key}" if segment_key is not None else ""
@@ -229,14 +245,45 @@ def reconstructed_depths_path(catalog: Path, instrument: str, segment_key: str |
 
 def load_reconstructed_depths(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
     started = time.perf_counter()
-    path = reconstructed_depths_path(catalog, instrument, segment_key)
-    if not path.exists():
-        raise FileNotFoundError(f"No reconstructed depth cache found: {path}. Run scripts/convert.py for the live instance first.")
+    exact_path = reconstructed_depths_path(catalog, instrument, segment_key)
+    if exact_path.exists():
+        paths = [exact_path]
+    else:
+        directory = catalog / "data" / RECONSTRUCT_DATA_TYPE / instrument
+        if segment_key is None:
+            paths = sorted(directory.glob("*.parquet"))
+        else:
+            segment = segment_from_key(segment_key)
+            matches = [
+                (segment_overlap_ratio(parse_catalog_file_segment(path), segment), path)
+                for path in sorted(directory.glob("*.parquet"))
+            ]
+            matches = [(ratio, path) for ratio, path in matches if ratio >= RECONSTRUCT_MATCH_MIN_RATIO]
+            paths = [max(matches, key=lambda match: (match[0], match[1].name))[1]] if matches else []
+        if not paths:
+            raise FileNotFoundError(f"No reconstructed depth cache found: {exact_path}. Run scripts/convert.py for the live instance first.")
 
-    LOGGER.info("read reconstructed depths start instrument=%s segment=%s path=%s", instrument, segment_key, path)
-    depths = pd.read_parquet(path)
+    LOGGER.info("read reconstructed depths start instrument=%s segment=%s files=%d", instrument, segment_key, len(paths))
+    frames = []
+    for file_index, path in enumerate(paths):
+        file_started = time.perf_counter()
+        frame = pd.read_parquet(path)
+        frame["_cache_file_index"] = file_index
+        frames.append(frame)
+        LOGGER.info(
+            "read reconstructed depth file instrument=%s segment=%s file=%d/%d rows=%d path=%s elapsed=%.3fs",
+            instrument,
+            segment_key,
+            file_index + 1,
+            len(paths),
+            len(frame),
+            path,
+            time.perf_counter() - file_started,
+        )
+
+    depths = pd.concat(frames, ignore_index=True)
     depths["dt"] = pd.to_datetime(depths["dt"], utc=True)
-    result = depths.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    result = depths.sort_values(["ts_init", "_cache_file_index", "_file_index", "_row"], kind="stable").reset_index(drop=True)
     LOGGER.info("read reconstructed depths done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
     return result
 

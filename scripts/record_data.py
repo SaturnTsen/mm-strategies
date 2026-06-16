@@ -76,15 +76,32 @@ STREAMING_DATA_TYPES = [
 CUSTOM_ENCODINGS[type(OKXInstrumentType.SPOT)] = lambda value: value.value
 CUSTOM_ENCODINGS[type(BybitProductType.SPOT)] = lambda value: value.value
 
+def parse_record_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Record multi-venue BTC spot market data to a Nautilus catalog.",
+    )
+    parser.add_argument("--trader-id", default="RECORDER-001")
+    parser.add_argument("-i", "--instrument", action="append", default=None)
+    parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG_PATH)
+    parser.add_argument("--flush-interval-ms", type=int, default=1000)
+    parser.add_argument("--max-file-size", type=int, default=128 * 1024 * 1024)
+    parser.add_argument("--book-interval-ms", type=int, default=10)
+    parser.add_argument("--http-timeout-secs", type=int, default=10)
+    parser.add_argument("--proxy-url", default=None)
+    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--log-data", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-minutes", type=float, default=30.0)
+    parser.add_argument("--instance-minutes", type=float, default=60.0)
+    parser.add_argument("--build-only", action="store_true")
+    args = parser.parse_args(argv)
+    if args.run_minutes <= 0:
+        raise ValueError("--run-minutes must be positive")
+    if args.instance_minutes <= 0:
+        raise ValueError("--instance-minutes must be positive")
+    return args
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "record":
-        record_main(parse_record_args(sys.argv[2:]))
-    else:
-        record_main(parse_record_args(sys.argv[1:]))
-
-
-def record_main(args: argparse.Namespace) -> None:
+    args = parse_record_args(sys.argv[1:])
     venue_instruments = parse_venue_instruments(args.instrument)
     catalog_path = args.catalog.expanduser()
     catalog_path.mkdir(parents=True, exist_ok=True)
@@ -290,29 +307,5 @@ def build_data_tester_config(
         },
     )
 
-
-def parse_record_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Record multi-venue BTC spot market data to a Nautilus catalog.",
-    )
-    parser.add_argument("--trader-id", default="RECORDER-001")
-    parser.add_argument("-i", "--instrument", action="append", default=None)
-    parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG_PATH)
-    parser.add_argument("--flush-interval-ms", type=int, default=1000)
-    parser.add_argument("--max-file-size", type=int, default=128 * 1024 * 1024)
-    parser.add_argument("--book-interval-ms", type=int, default=10)
-    parser.add_argument("--http-timeout-secs", type=int, default=10)
-    parser.add_argument("--proxy-url", default=None)
-    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    parser.add_argument("--log-data", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--run-minutes", type=float, default=30.0)
-    parser.add_argument("--instance-minutes", type=float, default=60.0)
-    parser.add_argument("--build-only", action="store_true")
-    args = parser.parse_args(argv)
-    if args.run_minutes <= 0:
-        raise ValueError("--run-minutes must be positive")
-    if args.instance_minutes <= 0:
-        raise ValueError("--instance-minutes must be positive")
-    return args
 if __name__ == "__main__":
     main()
