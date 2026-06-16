@@ -38,6 +38,8 @@ class AvellanedaStoikovMarketMakerConfig(StrategyConfig, frozen=True):
     trend_weight: float = 0.10
     trend_inventory_weight: float = 0.0
     trend_size_weight: float = 0.0
+    trend_gate: bool = False
+    trend_gate_threshold: float = 0.0
     min_spread_abs: PositiveFloat = 1.0
     min_spread_bps: PositiveFloat = 5.0
     quote_interval_ms: int = 0
@@ -55,6 +57,8 @@ class AvellanedaStoikovMarketMaker(Strategy):
             raise ValueError("trend_inventory_weight must be non-negative")
         if config.trend_size_weight < 0.0:
             raise ValueError("trend_size_weight must be non-negative")
+        if config.trend_gate_threshold < 0.0:
+            raise ValueError("trend_gate_threshold must be non-negative")
         if config.quote_interval_ms < 0:
             raise ValueError("quote_interval_ms must be non-negative")
         if config.book_data_type not in ("deltas", "depth10"):
@@ -158,6 +162,11 @@ class AvellanedaStoikovMarketMaker(Strategy):
             0.0,
             1.0 + self.config.eta * q - trend_size_skew,
         )
+        if self.config.trend_gate and abs(trend_signal) >= self.config.trend_gate_threshold:
+            if trend_signal < 0.0:
+                bid_size = 0.0
+            elif trend_signal > 0.0:
+                ask_size = 0.0
         self._replace_quotes(bid_quote, ask_quote, bid_size, ask_size)
 
     def _replace_quotes(self, bid_quote: float, ask_quote: float, bid_size: float, ask_size: float) -> None:

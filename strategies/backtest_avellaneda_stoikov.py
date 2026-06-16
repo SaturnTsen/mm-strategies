@@ -18,9 +18,8 @@ from data_utils import load_depths
 from data_utils import parse_catalog_file_segment
 from data_utils import segment_from_key
 from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.core.nautilus_pyo3 import BacktestEngine # type: ignore
 from nautilus_trader.config import LoggingConfig
-from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model import Money
@@ -37,7 +36,7 @@ from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
 
 
 DEFAULT_CATALOG_PATH = Path("catalog")
@@ -262,38 +261,6 @@ def file_token(value: float | int | str) -> str:
     return str(value).replace(".", "p").replace("-", "m").replace("/", "")
 
 
-def top_mid_from_book_data(instrument_id: InstrumentId, book_data: list[object], book_data_type: str) -> tuple[float, float]:
-    book = OrderBook(instrument_id=instrument_id, book_type=BookType.L2_MBP)
-    first_mid: float | None = None
-    last_mid: float | None = None
-    for batch in book_data:
-        if book_data_type == "depth10":
-            bid = batch.bids[0].price.as_double()
-            ask = batch.asks[0].price.as_double()
-            if bid <= 0.0 or ask <= bid:
-                continue
-            mid = (bid + ask) / 2.0
-        else:
-            book.apply_deltas(batch)
-            bid = book.best_bid_price()
-            ask = book.best_ask_price()
-            if bid is None or ask is None:
-                continue
-            mid = (bid.as_double() + ask.as_double()) / 2.0
-        first_mid = mid if first_mid is None else first_mid
-        last_mid = mid
-    if first_mid is None or last_mid is None:
-        raise ValueError("Cannot compute initial/final mid from order book data")
-    return first_mid, last_mid
-
-
-def final_total(account_report: pd.DataFrame, currency: str) -> float:
-    rows = account_report[account_report["currency"] == currency]
-    if rows.empty:
-        raise ValueError(f"No account rows for currency={currency}")
-    return float(rows.iloc[-1]["total"])
-
-
 def fill_metrics(fills_report: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[int, int]:
     window = pd.Timedelta(minutes=5)
     window_count = int((end - start) / window)
@@ -333,8 +300,6 @@ def main() -> None:
         args.max_minutes,
         args.book_data_type,
     )
-    initial_mid, final_mid = top_mid_from_book_data(instrument.id, book_data, args.book_data_type)
-
     engine = BacktestEngine(
         config=BacktestEngineConfig(
             trader_id=TraderId(args.trader_id),
@@ -388,15 +353,6 @@ def main() -> None:
     account_report = engine.trader.generate_account_report(venue)
     fills_report = engine.trader.generate_order_fills_report()
     positions_report = engine.trader.generate_positions_report()
-    final_cash = final_total(account_report, "USDT")
-    try:
-        final_base = final_total(account_report, "BTC")
-    except ValueError:
-        final_base = float(strategy.portfolio.net_position(instrument.id))
-    initial_base = 0.0 if account_type == AccountType.MARGIN else args.starting_base
-    initial_equity = args.starting_cash + initial_base * initial_mid
-    final_equity = final_cash + final_base * final_mid
-    final_pnl = final_equity - initial_equity
     portfolio_pnl = (
         money_as_float(strategy.portfolio.realized_pnl(instrument.id))
         + money_as_float(strategy.portfolio.unrealized_pnl(instrument.id))
@@ -439,13 +395,6 @@ def main() -> None:
             "segment": segment_key or "all",
             "start": start,
             "end": end,
-            "initial_mid": initial_mid,
-            "final_mid": final_mid,
-            "initial_equity": initial_equity,
-            "final_cash": final_cash,
-            "final_base": final_base,
-            "final_equity": final_equity,
-            "final_pnl": final_pnl,
             "portfolio_pnl": portfolio_pnl,
             "fills": fills_count,
             "min_5m_fills": min_5m_fills,
@@ -474,7 +423,6 @@ def main() -> None:
     print(f"fills={fills_count}")
     print(f"min_5m_fills={min_5m_fills}")
     print(f"duration_minutes={duration_minutes:.6f}")
-    print(f"final_pnl={final_pnl:.8f}")
     print(f"portfolio_pnl={portfolio_pnl:.8f}")
     print(f"passes_duration={passes_duration}")
     print(f"passes_fill_rate={passes_fill_rate}")
