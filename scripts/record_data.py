@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from threading import Timer
 from typing import Any
@@ -49,7 +50,6 @@ from nautilus_trader.core.nautilus_pyo3.okx import OKXInstrumentType  # type: ig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import OrderBookDeltas, QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.persistence.writer import RotationMode
 
 
@@ -73,22 +73,52 @@ STREAMING_DATA_TYPES = [
     TradeTick,
     OrderBookDeltas,
 ]
-
 CUSTOM_ENCODINGS[type(OKXInstrumentType.SPOT)] = lambda value: value.value
 CUSTOM_ENCODINGS[type(BybitProductType.SPOT)] = lambda value: value.value
 
 
 def main() -> None:
-    args = parse_args()
+    if len(sys.argv) > 1 and sys.argv[1] == "record":
+        record_main(parse_record_args(sys.argv[2:]))
+    else:
+        record_main(parse_record_args(sys.argv[1:]))
+
+
+def record_main(args: argparse.Namespace) -> None:
     venue_instruments = parse_venue_instruments(args.instrument)
-    instruments = [
-        instrument
-        for venue_values in venue_instruments.values()
-        for instrument in venue_values
-    ]
     catalog_path = args.catalog.expanduser()
     catalog_path.mkdir(parents=True, exist_ok=True)
 
+    if args.build_only:
+        node = build_recording_node(args, catalog_path, venue_instruments)
+        node.build()
+        print(f"Built multi-venue data recorder. Catalog: {catalog_path}")
+        return
+
+    remaining_minutes = args.run_minutes
+    session = 1
+    while remaining_minutes > 0.0:
+        session_minutes = min(args.instance_minutes, remaining_minutes)
+        node = build_recording_node(args, catalog_path, venue_instruments)
+        node.build()
+        print(f"Starting recording session {session}: duration={session_minutes:g} minutes instance={node.instance_id}")
+        stop_timer = Timer(session_minutes * 60.0, stop_node, args=(node, session_minutes))
+        stop_timer.start()
+
+        try:
+            node.run(raise_exception=True)
+        finally:
+            stop_timer.cancel()
+
+        remaining_minutes -= session_minutes
+        session += 1
+
+
+def build_recording_node(
+    args: argparse.Namespace,
+    catalog_path: Path,
+    venue_instruments: dict[str, list[str]],
+) -> TradingNode:
     node_config = TradingNodeConfig(
         trader_id=TraderId(args.trader_id),
         environment=Environment.LIVE,
@@ -118,25 +148,7 @@ def main() -> None:
     }.items():
         if venue in venue_instruments:
             node.add_data_client_factory(venue, factory)
-    node.build()
-
-    if args.build_only:
-        print(f"Built multi-venue data recorder. Catalog: {catalog_path}")
-        return
-
-    stop_timer = Timer(args.run_minutes * 60.0, stop_node, args=(node, args.run_minutes))
-    stop_timer.start()
-
-    try:
-        node.run(raise_exception=True)
-    finally:
-        stop_timer.cancel()
-        if args.convert_to_parquet:
-            convert_live_stream_to_parquet(
-                catalog_path=catalog_path,
-                instance_id=str(node.instance_id),
-                instruments=instruments,
-            )
+    return node
 
 
 def stop_node(node: TradingNode, run_minutes: float) -> None:
@@ -269,7 +281,7 @@ def build_data_tester_config(
             "component_id": f"DataTester-{venue}",
             "instrument_ids": instruments,
             "client_id": venue,
-            "subscribe_quotes": True,
+            "subscribe_quotes": venue != BYBIT,
             "subscribe_trades": True,
             "subscribe_book_deltas": True,
             "manage_book": True,
@@ -279,22 +291,7 @@ def build_data_tester_config(
     )
 
 
-def convert_live_stream_to_parquet(
-    catalog_path: Path,
-    instance_id: str,
-    instruments: list[str],
-) -> None:
-    catalog = ParquetDataCatalog(str(catalog_path))
-    for data_cls in STREAMING_DATA_TYPES:
-        catalog.convert_stream_to_data(
-            instance_id=instance_id,
-            data_cls=data_cls,
-            subdirectory="live",
-            identifiers=instruments,
-        )
-
-
-def parse_args() -> argparse.Namespace:
+def parse_record_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record multi-venue BTC spot market data to a Nautilus catalog.",
     )
@@ -306,16 +303,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--book-interval-ms", type=int, default=10)
     parser.add_argument("--http-timeout-secs", type=int, default=10)
     parser.add_argument("--proxy-url", default=None)
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--log-data", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--convert-to-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-minutes", type=float, default=30.0)
+    parser.add_argument("--instance-minutes", type=float, default=60.0)
     parser.add_argument("--build-only", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.run_minutes <= 0:
         raise ValueError("--run-minutes must be positive")
+    if args.instance_minutes <= 0:
+        raise ValueError("--instance-minutes must be positive")
     return args
-
-
 if __name__ == "__main__":
     main()

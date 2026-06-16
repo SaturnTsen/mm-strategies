@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+import time
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -19,9 +23,11 @@ from data_utils import (
     depth_snapshot_to_long,
     depths_to_top,
     discover_instruments,
+    discover_segments,
     load_depths,
     load_quotes,
     load_trades,
+    segment_from_key,
 )
 
 
@@ -31,30 +37,70 @@ DEFAULT_HOST = "127.0.0.1"
 MAX_TABLE_ROWS = 200
 DEFAULT_ANIMATION_INTERVAL_MS = 750
 PRICE_STACK_HEIGHT = 320
+LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def log_step(name: str, **fields: object) -> Iterator[None]:
+    started = time.perf_counter()
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    LOGGER.info("start %s%s", name, f" {details}" if details else "")
+    try:
+        yield
+    except Exception:
+        LOGGER.exception("failed %s after %.3fs", name, time.perf_counter() - started)
+        raise
+    LOGGER.info("done %s elapsed=%.3fs", name, time.perf_counter() - started)
 
 
 @lru_cache(maxsize=16)
-def load_instrument_data(catalog: str, instrument: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_instrument_data(catalog: str, instrument: str, segment_key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     catalog_path = Path(catalog)
-    depths = load_depth_data(catalog, instrument)
-    quotes = load_quotes(catalog_path, instrument)
-    trades = load_trades(catalog_path, instrument)
-    top = depths_to_top(depths)
+    with log_step("load_instrument_data", catalog=catalog, instrument=instrument, segment=segment_key):
+        depths = load_depth_data(catalog, instrument, segment_key)
+        with log_step("load_quotes", instrument=instrument):
+            quotes = load_quotes(catalog_path, instrument, segment_key)
+        with log_step("load_trades", instrument=instrument):
+            trades = load_trades(catalog_path, instrument, segment_key)
+        with log_step("depths_to_top", instrument=instrument, depth_rows=len(depths)):
+            top = depths_to_top(depths)
+        LOGGER.info(
+            "loaded instrument=%s quotes=%d trades=%d top=%d depths=%d",
+            instrument,
+            len(quotes),
+            len(trades),
+            len(top),
+            len(depths),
+        )
     return quotes, trades, top, depths
 
 
 @lru_cache(maxsize=16)
-def load_depth_data(catalog: str, instrument: str) -> pd.DataFrame:
-    return load_depths(Path(catalog), instrument)
+def load_depth_data(catalog: str, instrument: str, segment_key: str) -> pd.DataFrame:
+    with log_step("load_depths", catalog=catalog, instrument=instrument, segment=segment_key):
+        depths = load_depths(Path(catalog), instrument, segment_key)
+        LOGGER.info("loaded depths instrument=%s rows=%d", instrument, len(depths))
+        return depths
 
 
 @lru_cache(maxsize=128)
-def reconstruct_depth_at(catalog: str, instrument: str, end_ms: int) -> pd.DataFrame:
-    depths = load_depth_data(catalog, instrument)
-    depths_until_end = depths[depths["dt"] <= from_ms(end_ms)]
-    if depths_until_end.empty:
-        raise ValueError(f"No order book depth before selected end time for {instrument}")
-    return depth_snapshot_to_long(depths_until_end)
+def load_depth_snapshot_at(catalog: str, instrument: str, segment_key: str, end_ms: int) -> pd.DataFrame:
+    with log_step("load_depth_snapshot_at", instrument=instrument, segment=segment_key, end=format_utc_ms(end_ms)):
+        depths = load_depth_data(catalog, instrument, segment_key)
+        end = from_ms(end_ms)
+        depths_until_end = depths[depths["dt"] <= end]
+        LOGGER.info(
+            "depth slice instrument=%s end=%s rows=%d total_rows=%d",
+            instrument,
+            end,
+            len(depths_until_end),
+            len(depths),
+        )
+        if depths_until_end.empty:
+            raise ValueError(f"No order book depth before selected end time for {instrument}")
+        depth = depth_snapshot_to_long(depths_until_end)
+        LOGGER.info("loaded depth snapshot instrument=%s levels=%d", instrument, len(depth))
+        return depth
 
 
 def to_ms(value: pd.Timestamp) -> int:
@@ -118,27 +164,27 @@ def filter_time(frame: pd.DataFrame, time_range: list[int] | tuple[int, int]) ->
     return frame[(frame["dt"] >= start) & (frame["dt"] <= end)]
 
 
-def time_bounds(catalog: str, instrument: str) -> tuple[int, int]:
-    quotes, trades, top, _ = load_instrument_data(catalog, instrument)
+def time_bounds(catalog: str, instrument: str, segment_key: str) -> tuple[int, int]:
+    quotes, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
     start = min(quotes["dt"].min(), trades["dt"].min(), top["dt"].min())
     end = max(quotes["dt"].max(), trades["dt"].max(), top["dt"].max())
     return to_ms(start), to_ms(end)
 
 
-def instruments_time_bounds(catalog: str, instruments: list[str]) -> tuple[int, int]:
-    bounds = [time_bounds(catalog, instrument) for instrument in instruments]
+def instruments_time_bounds(catalog: str, instruments: list[str], segment_key: str) -> tuple[int, int]:
+    bounds = [time_bounds(catalog, instrument, segment_key) for instrument in instruments]
     return min(start for start, _ in bounds), max(end for _, end in bounds)
 
 
-def valid_window_bounds(catalog: str, instrument: str) -> tuple[int, int]:
-    quotes, _, top, _ = load_instrument_data(catalog, instrument)
+def valid_window_bounds(catalog: str, instrument: str, segment_key: str) -> tuple[int, int]:
+    quotes, _, top, _ = load_instrument_data(catalog, instrument, segment_key)
     start = max(quotes["dt"].min(), top["dt"].min())
     end = min(quotes["dt"].max(), top["dt"].max())
     return to_ms(start), to_ms(end)
 
 
-def instruments_valid_window_bounds(catalog: str, instruments: list[str]) -> tuple[int, int]:
-    bounds = [valid_window_bounds(catalog, instrument) for instrument in instruments]
+def instruments_valid_window_bounds(catalog: str, instruments: list[str], segment_key: str) -> tuple[int, int]:
+    bounds = [valid_window_bounds(catalog, instrument, segment_key) for instrument in instruments]
     start = max(start for start, _ in bounds)
     end = min(end for _, end in bounds)
     if start >= end:
@@ -168,99 +214,59 @@ def figure_layout(fig: go.Figure, height: int) -> go.Figure:
     return fig
 
 
-def render_summary(catalog: str, instrument: str, time_range: list[int]) -> html.Div:
-    quotes, trades, top, _ = load_instrument_data(catalog, instrument)
-    quotes_window = filter_time(quotes, time_range)
-    trades_window = filter_time(trades, time_range)
-    top_window = filter_time(top, time_range)
+def render_summary(catalog: str, instrument: str, segment_key: str, time_range: list[int]) -> html.Div:
+    with log_step("render_summary", instrument=instrument, segment=segment_key, start=format_utc_ms(time_range[0]), end=format_utc_ms(time_range[1])):
+        quotes, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
+        quotes_window = filter_time(quotes, time_range)
+        trades_window = filter_time(trades, time_range)
+        top_window = filter_time(top, time_range)
+        LOGGER.info(
+            "summary window instrument=%s quotes=%d trades=%d top=%d",
+            instrument,
+            len(quotes_window),
+            len(trades_window),
+            len(top_window),
+        )
 
-    if quotes_window.empty or top_window.empty:
+        if quotes_window.empty or top_window.empty:
+            return html.Div(
+                [
+                    html.Div([html.Div("instrument", className="summary-key"), html.Div(instrument, className="summary-value")]),
+                    html.Div([html.Div("window", className="summary-key"), html.Div("no quote/top data", className="summary-value")]),
+                    html.Div([html.Div("start", className="summary-key"), html.Div(str(from_ms(time_range[0])), className="summary-value")]),
+                    html.Div([html.Div("end", className="summary-key"), html.Div(str(from_ms(time_range[1])), className="summary-value")]),
+                ],
+                className="summary-grid",
+            )
+
+        values = [
+            ("instrument", instrument),
+            ("quotes", len(quotes_window)),
+            ("trades", len(trades_window)),
+            ("top snapshots", len(top_window)),
+            ("depth levels", int(top_window["bid_levels"].iloc[-1] + top_window["ask_levels"].iloc[-1])),
+            ("start", str(top_window["dt"].min())),
+            ("end", str(top_window["dt"].max())),
+            ("last bid", f"{top_window['best_bid'].iloc[-1]:.8g}"),
+            ("last ask", f"{top_window['best_ask'].iloc[-1]:.8g}"),
+            ("last spread bps", f"{top_window['spread_bps'].iloc[-1]:.4f}"),
+        ]
         return html.Div(
-            [
-                html.Div([html.Div("instrument", className="summary-key"), html.Div(instrument, className="summary-value")]),
-                html.Div([html.Div("window", className="summary-key"), html.Div("no quote/top data", className="summary-value")]),
-                html.Div([html.Div("start", className="summary-key"), html.Div(str(from_ms(time_range[0])), className="summary-value")]),
-                html.Div([html.Div("end", className="summary-key"), html.Div(str(from_ms(time_range[1])), className="summary-value")]),
-            ],
+            [html.Div([html.Div(key, className="summary-key"), html.Div(value, className="summary-value")]) for key, value in values],
             className="summary-grid",
         )
 
-    values = [
-        ("instrument", instrument),
-        ("quotes", len(quotes_window)),
-        ("trades", len(trades_window)),
-        ("top snapshots", len(top_window)),
-        ("depth levels", int(top_window["bid_levels"].iloc[-1] + top_window["ask_levels"].iloc[-1])),
-        ("start", str(top_window["dt"].min())),
-        ("end", str(top_window["dt"].max())),
-        ("last bid", f"{top_window['best_bid'].iloc[-1]:.8g}"),
-        ("last ask", f"{top_window['best_ask'].iloc[-1]:.8g}"),
-        ("last spread bps", f"{top_window['spread_bps'].iloc[-1]:.4f}"),
-    ]
-    return html.Div(
-        [html.Div([html.Div(key, className="summary-key"), html.Div(value, className="summary-value")]) for key, value in values],
-        className="summary-grid",
-    )
 
-
-def render_price_figure(catalog: str, instrument: str, time_range: list[int]) -> go.Figure:
-    _, trades, top, _ = load_instrument_data(catalog, instrument)
-    top_window = filter_time(top, time_range)
-    trades_window = filter_time(trades, time_range)
-    if top_window.empty:
-        raise ValueError(f"No top-of-book data in selected window for {instrument}")
-
-    fig = go.Figure()
-    for column, color in [("best_bid", "#1f7a4d"), ("best_ask", "#b33b3b"), ("mid", "#245c7a")]:
-        fig.add_trace(
-            go.Scattergl(
-                x=plot_dt(top_window),
-                y=top_window[column],
-                mode="lines",
-                name=column,
-                line={"width": 1.2, "color": color},
-            )
-        )
-
-    if not trades_window.empty:
-        fig.add_trace(
-            go.Scattergl(
-                x=plot_dt(trades_window),
-                y=trades_window["price_f"],
-                mode="markers",
-                name="trades",
-                marker={
-                    "size": 5,
-                    "color": trades_window["size_f"],
-                    "colorscale": "Viridis",
-                    "showscale": True,
-                    "colorbar": {"title": "size"},
-                    "opacity": 0.6,
-                },
-            )
-        )
-
-    fig.update_xaxes(title_text="time")
-    fig.update_yaxes(title_text="price")
-    fig.update_layout(title=f"{instrument} top of book")
-    return figure_layout(fig, 520)
-
-
-def render_price_stack_figure(catalog: str, instruments: list[str], time_range: list[int]) -> go.Figure:
-    fig = make_subplots(
-        rows=len(instruments),
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.055,
-        subplot_titles=instruments,
-    )
-    for row, instrument in enumerate(instruments, start=1):
-        _, trades, top, _ = load_instrument_data(catalog, instrument)
+def render_price_figure(catalog: str, instrument: str, segment_key: str, time_range: list[int]) -> go.Figure:
+    with log_step("render_price_figure", instrument=instrument, segment=segment_key, start=format_utc_ms(time_range[0]), end=format_utc_ms(time_range[1])):
+        _, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
         top_window = filter_time(top, time_range)
         trades_window = filter_time(trades, time_range)
+        LOGGER.info("price window instrument=%s top=%d trades=%d", instrument, len(top_window), len(trades_window))
         if top_window.empty:
             raise ValueError(f"No top-of-book data in selected window for {instrument}")
 
+        fig = go.Figure()
         for column, color in [("best_bid", "#1f7a4d"), ("best_ask", "#b33b3b"), ("mid", "#245c7a")]:
             fig.add_trace(
                 go.Scattergl(
@@ -268,12 +274,8 @@ def render_price_stack_figure(catalog: str, instruments: list[str], time_range: 
                     y=top_window[column],
                     mode="lines",
                     name=column,
-                    legendgroup=column,
-                    showlegend=row == 1,
                     line={"width": 1.2, "color": color},
-                ),
-                row=row,
-                col=1,
+                )
             )
 
         if not trades_window.empty:
@@ -283,87 +285,188 @@ def render_price_stack_figure(catalog: str, instruments: list[str], time_range: 
                     y=trades_window["price_f"],
                     mode="markers",
                     name="trades",
-                    legendgroup="trades",
-                    showlegend=row == 1,
-                    marker={"size": 5, "color": "#7c3aed", "opacity": 0.55},
-                ),
-                row=row,
-                col=1,
+                    marker={
+                        "size": 5,
+                        "color": trades_window["size_f"],
+                        "colorscale": "Viridis",
+                        "showscale": True,
+                        "colorbar": {"title": "size"},
+                        "opacity": 0.6,
+                    },
+                )
             )
-        fig.update_yaxes(title_text="price", row=row, col=1)
 
-    fig.update_xaxes(title_text="time", row=len(instruments), col=1)
-    fig.update_layout(title="Selected instruments top of book")
-    return figure_layout(fig, max(420, PRICE_STACK_HEIGHT * len(instruments)))
-
-
-def render_microstructure_figure(catalog: str, instrument: str, time_range: list[int]) -> go.Figure:
-    _, _, top, _ = load_instrument_data(catalog, instrument)
-    top_window = filter_time(top, time_range)
-    if top_window.empty:
-        raise ValueError(f"No top-of-book data in selected window for {instrument}")
-
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("spread", "top level imbalance"))
-    fig.add_trace(
-        go.Scattergl(x=plot_dt(top_window), y=top_window["spread_bps"], mode="lines", name="spread bps"),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(x=plot_dt(top_window), y=top_window["top_imbalance"], mode="lines", name="imbalance"),
-        row=2,
-        col=1,
-    )
-    fig.add_hline(y=0.0, line_width=1, line_color="#555", opacity=0.45, row=2, col=1) # type: ignore
-    fig.update_xaxes(title_text="time", row=2, col=1)
-    fig.update_yaxes(title_text="bps", row=1, col=1)
-    fig.update_yaxes(title_text="imbalance", row=2, col=1)
-    return figure_layout(fig, 650)
+        fig.update_xaxes(title_text="time")
+        fig.update_yaxes(title_text="price")
+        fig.update_layout(title=f"{instrument} top of book")
+        return figure_layout(fig, 520)
 
 
-def render_activity_figure(catalog: str, instrument: str, time_range: list[int]) -> go.Figure:
-    quotes, trades, top, _ = load_instrument_data(catalog, instrument)
-    quotes_window = filter_time(quotes, time_range)
-    trades_window = filter_time(trades, time_range)
-    top_window = filter_time(top, time_range)
-    if quotes_window.empty or top_window.empty:
-        raise ValueError(f"No activity data in selected window for {instrument}")
+def render_price_stack_figure(catalog: str, instruments: list[str], segment_key: str, time_range: list[int]) -> go.Figure:
+    with log_step(
+        "render_price_stack_figure",
+        instruments=",".join(instruments),
+        segment=segment_key,
+        start=format_utc_ms(time_range[0]),
+        end=format_utc_ms(time_range[1]),
+    ):
+        fig = make_subplots(
+            rows=len(instruments),
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.055,
+            subplot_titles=instruments,
+        )
+        for row, instrument in enumerate(instruments, start=1):
+            _, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
+            top_window = filter_time(top, time_range)
+            trades_window = filter_time(trades, time_range)
+            LOGGER.info("price stack window instrument=%s top=%d trades=%d", instrument, len(top_window), len(trades_window))
+            if top_window.empty:
+                raise ValueError(f"No top-of-book data in selected window for {instrument}")
 
-    quote_counts = quotes_window.set_index("dt")["mid_f"].resample("1s").count().rename("quotes")
-    trade_counts = trades_window.set_index("dt")["price_f"].resample("1s").count().rename("trades")
-    counts = pd.concat([quote_counts, trade_counts], axis=1).fillna(0.0).reset_index()
+            for column, color in [("best_bid", "#1f7a4d"), ("best_ask", "#b33b3b"), ("mid", "#245c7a")]:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=plot_dt(top_window),
+                        y=top_window[column],
+                        mode="lines",
+                        name=column,
+                        legendgroup=column,
+                        showlegend=row == 1,
+                        line={"width": 1.2, "color": color},
+                    ),
+                    row=row,
+                    col=1,
+                )
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("event rate", "book levels"))
-    for column in ["quotes", "trades"]:
+            if not trades_window.empty:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=plot_dt(trades_window),
+                        y=trades_window["price_f"],
+                        mode="markers",
+                        name="trades",
+                        legendgroup="trades",
+                        showlegend=row == 1,
+                        marker={"size": 5, "color": "#7c3aed", "opacity": 0.55},
+                    ),
+                    row=row,
+                    col=1,
+                )
+            fig.update_yaxes(title_text="price", row=row, col=1)
+
+        fig.update_xaxes(title_text="time", row=len(instruments), col=1)
+        fig.update_layout(title="Selected instruments top of book")
+        return figure_layout(fig, max(420, PRICE_STACK_HEIGHT * len(instruments)))
+
+
+def render_microstructure_figure(catalog: str, instrument: str, segment_key: str, time_range: list[int]) -> go.Figure:
+    with log_step("render_microstructure_figure", instrument=instrument, segment=segment_key, start=format_utc_ms(time_range[0]), end=format_utc_ms(time_range[1])):
+        _, _, top, _ = load_instrument_data(catalog, instrument, segment_key)
+        top_window = filter_time(top, time_range)
+        LOGGER.info("microstructure window instrument=%s top=%d", instrument, len(top_window))
+        if top_window.empty:
+            raise ValueError(f"No top-of-book data in selected window for {instrument}")
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("spread", "top level imbalance"))
         fig.add_trace(
-            go.Scattergl(x=counts["dt"].dt.tz_localize(None), y=counts[column], mode="lines", name=column, line_shape="hv"),
+            go.Scattergl(x=plot_dt(top_window), y=top_window["spread_bps"], mode="lines", name="spread bps"),
             row=1,
             col=1,
         )
-    for column in ["bid_levels", "ask_levels"]:
-        fig.add_trace(go.Scattergl(x=plot_dt(top_window), y=top_window[column], mode="lines", name=column), row=2, col=1)
+        fig.add_trace(
+            go.Scattergl(x=plot_dt(top_window), y=top_window["top_imbalance"], mode="lines", name="imbalance"),
+            row=2,
+            col=1,
+        )
+        fig.add_hline(y=0.0, line_width=1, line_color="#555", opacity=0.45, row=2, col=1) # type: ignore
+        fig.update_xaxes(title_text="time", row=2, col=1)
+        fig.update_yaxes(title_text="bps", row=1, col=1)
+        fig.update_yaxes(title_text="imbalance", row=2, col=1)
+        fig.update_layout(title=f"{instrument} microstructure")
+        return figure_layout(fig, 650)
 
-    fig.update_xaxes(title_text="time", row=2, col=1)
-    fig.update_yaxes(title_text="events / second", row=1, col=1)
-    fig.update_yaxes(title_text="levels", row=2, col=1)
-    return figure_layout(fig, 650)
+
+def render_activity_figure(catalog: str, instrument: str, segment_key: str, time_range: list[int]) -> go.Figure:
+    with log_step("render_activity_figure", instrument=instrument, segment=segment_key, start=format_utc_ms(time_range[0]), end=format_utc_ms(time_range[1])):
+        quotes, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
+        quotes_window = filter_time(quotes, time_range)
+        trades_window = filter_time(trades, time_range)
+        top_window = filter_time(top, time_range)
+        LOGGER.info(
+            "activity window instrument=%s quotes=%d trades=%d top=%d",
+            instrument,
+            len(quotes_window),
+            len(trades_window),
+            len(top_window),
+        )
+        if quotes_window.empty or top_window.empty:
+            raise ValueError(f"No activity data in selected window for {instrument}")
+
+        quote_counts = quotes_window.set_index("dt")["mid_f"].resample("1s").count().rename("quotes")
+        trade_counts = trades_window.set_index("dt")["price_f"].resample("1s").count().rename("trades")
+        counts = pd.concat([quote_counts, trade_counts], axis=1).fillna(0.0).reset_index()
+        LOGGER.info("activity resample instrument=%s rows=%d", instrument, len(counts))
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("event rate", "book levels"))
+        for column in ["quotes", "trades"]:
+            fig.add_trace(
+                go.Scattergl(x=counts["dt"].dt.tz_localize(None), y=counts[column], mode="lines", name=column, line_shape="hv"),
+                row=1,
+                col=1,
+            )
+        for column in ["bid_levels", "ask_levels"]:
+            fig.add_trace(go.Scattergl(x=plot_dt(top_window), y=top_window[column], mode="lines", name=column), row=2, col=1)
+
+        fig.update_xaxes(title_text="time", row=2, col=1)
+        fig.update_yaxes(title_text="events / second", row=1, col=1)
+        fig.update_yaxes(title_text="levels", row=2, col=1)
+        fig.update_layout(title=f"{instrument} activity")
+        return figure_layout(fig, 650)
 
 
-def render_depth_figure(catalog: str, instrument: str, time_range: list[int], levels: int, height: int = 620) -> go.Figure:
-    depth = reconstruct_depth_at(catalog, instrument, time_range[1])
-    if depth.empty:
-        raise ValueError(f"No depth data for {instrument}")
+def render_depth_figure(catalog: str, instrument: str, segment_key: str, time_range: list[int], levels: int, height: int = 620) -> go.Figure:
+    with log_step("render_depth_figure", instrument=instrument, segment=segment_key, end=format_utc_ms(time_range[1]), levels=levels):
+        depth = load_depth_snapshot_at(catalog, instrument, segment_key, time_range[1])
+        if depth.empty:
+            raise ValueError(f"No depth data for {instrument}")
 
-    bids = depth[depth["side"] == "bid"].sort_values("price", ascending=False).head(levels)
-    asks = depth[depth["side"] == "ask"].sort_values("price", ascending=True).head(levels)
+        bids = depth[depth["side"] == "bid"].sort_values("price", ascending=False).head(levels)
+        asks = depth[depth["side"] == "ask"].sort_values("price", ascending=True).head(levels)
+        LOGGER.info("depth figure instrument=%s bid_levels=%d ask_levels=%d", instrument, len(bids), len(asks))
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=-bids["size"], y=bids["price"], orientation="h", name="bid", marker_color="#b33b3b"))
-    fig.add_trace(go.Bar(x=asks["size"], y=asks["price"], orientation="h", name="ask", marker_color="#1f7a4d"))
-    fig.update_xaxes(title_text="signed size")
-    fig.update_yaxes(title_text="price")
-    fig.update_layout(title=f"{instrument} reconstructed depth at {from_ms(time_range[1])}", barmode="overlay")
-    return figure_layout(fig, height)
+        bids = bids.assign(label=bids.apply(lambda row: f"bid {int(row['level'])}: {row['price']:.8g}", axis=1))
+        asks = asks.assign(label=asks.apply(lambda row: f"ask {int(row['level'])}: {row['price']:.8g}", axis=1))
+        category_order = list(reversed(asks["label"].tolist())) + bids["label"].tolist()
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=-bids["size"],
+                y=bids["label"],
+                orientation="h",
+                name="bid",
+                marker_color="#b33b3b",
+                customdata=bids[["price", "size", "level"]],
+                hovertemplate="bid level %{customdata[2]}<br>price=%{customdata[0]:.8g}<br>size=%{customdata[1]:.8g}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                x=asks["size"],
+                y=asks["label"],
+                orientation="h",
+                name="ask",
+                marker_color="#1f7a4d",
+                customdata=asks[["price", "size", "level"]],
+                hovertemplate="ask level %{customdata[2]}<br>price=%{customdata[0]:.8g}<br>size=%{customdata[1]:.8g}<extra></extra>",
+            )
+        )
+        fig.update_xaxes(title_text="signed size")
+        fig.update_yaxes(title_text="level / price", categoryorder="array", categoryarray=category_order)
+        fig.update_layout(title=f"{instrument} depth <br> {from_ms(time_range[1])}", barmode="overlay")
+        return figure_layout(fig, height)
 
 
 def table_data(frame: pd.DataFrame, columns: list[str]) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
@@ -393,47 +496,56 @@ def data_table(frame: pd.DataFrame, columns: list[str]) -> dash_table.DataTable:
     )
 
 
-def render_tables(catalog: str, instrument: str, time_range: list[int]) -> dcc.Tabs:
-    quotes, trades, top, _ = load_instrument_data(catalog, instrument)
-    quotes_window = filter_time(quotes, time_range)
-    trades_window = filter_time(trades, time_range)
-    top_window = filter_time(top, time_range)
-    depth = reconstruct_depth_at(catalog, instrument, time_range[1])
+def render_tables(catalog: str, instrument: str, segment_key: str, time_range: list[int]) -> dcc.Tabs:
+    with log_step("render_tables", instrument=instrument, segment=segment_key, start=format_utc_ms(time_range[0]), end=format_utc_ms(time_range[1])):
+        quotes, trades, top, _ = load_instrument_data(catalog, instrument, segment_key)
+        quotes_window = filter_time(quotes, time_range)
+        trades_window = filter_time(trades, time_range)
+        top_window = filter_time(top, time_range)
+        depth = load_depth_snapshot_at(catalog, instrument, segment_key, time_range[1])
+        LOGGER.info(
+            "tables window instrument=%s quotes=%d trades=%d top=%d depth=%d",
+            instrument,
+            len(quotes_window),
+            len(trades_window),
+            len(top_window),
+            len(depth),
+        )
 
-    return dcc.Tabs(
-        [
-            dcc.Tab(
-                label="Top",
-                children=data_table(
-                    top_window,
-                    [
-                        "dt",
-                        "best_bid",
-                        "best_ask",
-                        "bid_size",
-                        "ask_size",
-                        "mid",
-                        "spread_bps",
-                        "top_imbalance",
-                        "bid_levels",
-                        "ask_levels",
-                    ],
+        return dcc.Tabs(
+            [
+                dcc.Tab(
+                    label="Top",
+                    children=data_table(
+                        top_window,
+                        [
+                            "dt",
+                            "best_bid",
+                            "best_ask",
+                            "bid_size",
+                            "ask_size",
+                            "mid",
+                            "spread_bps",
+                            "top_imbalance",
+                            "bid_levels",
+                            "ask_levels",
+                        ],
+                    ),
                 ),
-            ),
-            dcc.Tab(
-                label="Quotes",
-                children=data_table(
-                    quotes_window,
-                    ["dt", "bid_price_f", "ask_price_f", "bid_size_f", "ask_size_f", "mid_f", "spread_bps"],
+                dcc.Tab(
+                    label="Quotes",
+                    children=data_table(
+                        quotes_window,
+                        ["dt", "bid_price_f", "ask_price_f", "bid_size_f", "ask_size_f", "mid_f", "spread_bps"],
+                    ),
                 ),
-            ),
-            dcc.Tab(
-                label="Trades",
-                children=data_table(trades_window, ["dt", "price_f", "size_f", "aggressor_side", "trade_id"]),
-            ),
-            dcc.Tab(label="Depth", children=data_table(depth, ["side", "price", "size"])),
-        ]
-    )
+                dcc.Tab(
+                    label="Trades",
+                    children=data_table(trades_window, ["dt", "price_f", "size_f", "aggressor_side", "trade_id"]),
+                ),
+                dcc.Tab(label="Depth", children=data_table(depth, ["side", "price", "size"])),
+            ]
+        )
 
 
 def empty_figure(message: str) -> go.Figure:
@@ -500,12 +612,29 @@ def app_index_string() -> str:
 
 
 def build_app(catalog: Path) -> Dash:
-    catalog_path = catalog.expanduser().resolve()
-    catalog_key = str(catalog_path)
-    instruments = discover_instruments(catalog_path)
-    initial_instrument = instruments[0]
-    start_ms, end_ms = time_bounds(catalog_key, initial_instrument)
-    animation_start_ms, animation_end_ms = valid_window_bounds(catalog_key, initial_instrument)
+    with log_step("build_app", catalog=catalog):
+        catalog_path = catalog.expanduser().resolve()
+        catalog_key = str(catalog_path)
+        with log_step("discover_instruments", catalog=catalog_path):
+            instruments = discover_instruments(catalog_path)
+        with log_step("discover_segments", catalog=catalog_path):
+            segments = discover_segments(catalog_path)
+        LOGGER.info("discovered instruments count=%d values=%s", len(instruments), ",".join(instruments))
+        LOGGER.info("discovered segments count=%d values=%s", len(segments), ",".join(segment.key for segment in segments))
+        initial_instrument = instruments[0]
+        initial_segment = segments[-1]
+        initial_segment_key = initial_segment.key
+        start_ms, end_ms = to_ms(initial_segment.start), to_ms(initial_segment.end)
+        animation_start_ms, animation_end_ms = start_ms, end_ms
+        LOGGER.info(
+            "initial instrument=%s segment=%s time_range=%s..%s animation_range=%s..%s",
+            initial_instrument,
+            initial_segment_key,
+            format_utc_ms(start_ms),
+            format_utc_ms(end_ms),
+            format_utc_ms(animation_start_ms),
+            format_utc_ms(animation_end_ms),
+        )
 
     app = Dash(__name__, title="Nautilus Catalog Viewer")
     app.index_string = app_index_string()
@@ -517,6 +646,14 @@ def build_app(catalog: Path) -> Dash:
                         [
                             html.H1("Nautilus Catalog Viewer", className="title"),
                             html.Div(f"Catalog: {catalog_path}", className="subtitle"),
+                            html.Div("Recording Segment", className="control-label"),
+                            dcc.Dropdown(
+                                id="segment",
+                                options=[{"label": segment.label, "value": segment.key} for segment in segments],
+                                value=initial_segment_key,
+                                clearable=False,
+                                multi=False,
+                            ),
                             html.Div("Instrument", className="control-label"),
                             dcc.Dropdown(
                                 id="instrument",
@@ -662,22 +799,34 @@ def build_app(catalog: Path) -> Dash:
         Output("time-end-input", "value"),
         Output("animation-start-input", "value"),
         Output("animation-end-input", "value"),
+        Input("segment", "value"),
         Input("instrument", "value"),
     )
-    def update_time_range(instrument: list[str] | str):
-        instruments = selected_instruments(instrument)
-        next_start_ms, next_end_ms = instruments_time_bounds(catalog_key, instruments)
-        animation_start_ms, animation_end_ms = instruments_valid_window_bounds(catalog_key, instruments)
-        return (
-            next_start_ms,
-            next_end_ms,
-            [next_start_ms, next_end_ms],
-            slider_marks(next_start_ms, next_end_ms),
-            format_utc_ms(next_start_ms),
-            format_utc_ms(next_end_ms),
-            format_utc_ms(animation_start_ms),
-            format_utc_ms(animation_end_ms),
-        )
+    def update_time_range(segment_key: str, instrument: list[str] | str):
+        with log_step("callback.update_time_range", segment=segment_key, instrument=instrument):
+            instruments = selected_instruments(instrument)
+            segment = segment_from_key(segment_key)
+            next_start_ms, next_end_ms = to_ms(segment.start), to_ms(segment.end)
+            animation_start_ms, animation_end_ms = next_start_ms, next_end_ms
+            LOGGER.info(
+                "time range segment=%s instruments=%s full=%s..%s animation=%s..%s",
+                segment_key,
+                ",".join(instruments),
+                format_utc_ms(next_start_ms),
+                format_utc_ms(next_end_ms),
+                format_utc_ms(animation_start_ms),
+                format_utc_ms(animation_end_ms),
+            )
+            return (
+                next_start_ms,
+                next_end_ms,
+                [next_start_ms, next_end_ms],
+                slider_marks(next_start_ms, next_end_ms),
+                format_utc_ms(next_start_ms),
+                format_utc_ms(next_end_ms),
+                format_utc_ms(animation_start_ms),
+                format_utc_ms(animation_end_ms),
+            )
 
     @app.callback(
         Output("time-start-input", "value", allow_duplicate=True),
@@ -698,7 +847,10 @@ def build_app(catalog: Path) -> Dash:
         prevent_initial_call=True,
     )
     def apply_window(_: int, start_value: str, end_value: str, lower: int, upper: int):
-        return normalized_range(parse_utc_ms(start_value), parse_utc_ms(end_value), lower, upper)
+        with log_step("callback.apply_window", start=start_value, end=end_value, lower=lower, upper=upper):
+            window = normalized_range(parse_utc_ms(start_value), parse_utc_ms(end_value), lower, upper)
+            LOGGER.info("applied window start=%s end=%s", format_utc_ms(window[0]), format_utc_ms(window[1]))
+            return window
 
     @app.callback(
         Output("animation-tick", "disabled"),
@@ -728,33 +880,45 @@ def build_app(catalog: Path) -> Dash:
         lower: int,
         upper: int,
     ):
-        if ctx.triggered_id == "animation-stop":
-            return True, no_update, no_update, no_update, "stopped"
+        with log_step("callback.configure_animation", triggered_id=ctx.triggered_id):
+            if ctx.triggered_id == "animation-stop":
+                LOGGER.info("animation stopped")
+                return True, no_update, no_update, no_update, "stopped"
 
-        try:
-            animation_range = normalized_range(parse_utc_ms(start_value), parse_utc_ms(end_value), lower, upper)
-            increment_ms = int(parse_positive_float(increment_sec, "increment_sec") * 1_000)
-            window_length_ms = int(parse_positive_float(window_length_sec, "window_length_sec") * 1_000)
-            interval = int(parse_positive_float(interval_ms, "interval_ms"))
-        except ValueError as error:
-            return True, no_update, no_update, no_update, f"error: {error}"
+            try:
+                animation_range = normalized_range(parse_utc_ms(start_value), parse_utc_ms(end_value), lower, upper)
+                increment_ms = int(parse_positive_float(increment_sec, "increment_sec") * 1_000)
+                window_length_ms = int(parse_positive_float(window_length_sec, "window_length_sec") * 1_000)
+                interval = int(parse_positive_float(interval_ms, "interval_ms"))
+            except ValueError as error:
+                LOGGER.info("animation config error=%s", error)
+                return True, no_update, no_update, no_update, f"error: {error}"
 
-        frame_start_ms = animation_range[0]
-        frame_end_ms = min(frame_start_ms + window_length_ms, animation_range[1])
-        if frame_start_ms >= frame_end_ms:
-            return True, no_update, no_update, no_update, "error: animation window is empty"
-        return (
-            frame_end_ms >= animation_range[1],
-            interval,
-            {
-                "cursor_ms": frame_start_ms + increment_ms,
-                "end_ms": animation_range[1],
-                "increment_ms": increment_ms,
-                "window_length_ms": window_length_ms,
-            },
-            [frame_start_ms, frame_end_ms],
-            f"running: {format_utc_ms(frame_start_ms)} -> {format_utc_ms(frame_end_ms)}",
-        )
+            frame_start_ms = animation_range[0]
+            frame_end_ms = min(frame_start_ms + window_length_ms, animation_range[1])
+            if frame_start_ms >= frame_end_ms:
+                LOGGER.info("animation window is empty")
+                return True, no_update, no_update, no_update, "error: animation window is empty"
+            LOGGER.info(
+                "animation configured range=%s..%s increment_ms=%d window_length_ms=%d interval_ms=%d",
+                format_utc_ms(animation_range[0]),
+                format_utc_ms(animation_range[1]),
+                increment_ms,
+                window_length_ms,
+                interval,
+            )
+            return (
+                frame_end_ms >= animation_range[1],
+                interval,
+                {
+                    "cursor_ms": frame_start_ms + increment_ms,
+                    "end_ms": animation_range[1],
+                    "increment_ms": increment_ms,
+                    "window_length_ms": window_length_ms,
+                },
+                [frame_start_ms, frame_end_ms],
+                f"running: {format_utc_ms(frame_start_ms)} -> {format_utc_ms(frame_end_ms)}",
+            )
 
     @app.callback(
         Output("time-range", "value", allow_duplicate=True),
@@ -768,122 +932,137 @@ def build_app(catalog: Path) -> Dash:
         prevent_initial_call=True,
     )
     def advance_animation(_: int, state: dict[str, int], lower: int, upper: int):
-        cursor_ms = clamp_ms(int(state["cursor_ms"]), lower, upper)
-        end_ms = clamp_ms(int(state["end_ms"]), lower, upper)
-        increment_ms = int(state["increment_ms"])
-        window_length_ms = int(state["window_length_ms"])
-        if cursor_ms >= end_ms:
-            frame_start_ms = max(lower, end_ms - window_length_ms)
-            return [frame_start_ms, end_ms], state, True, "finished"
+        with log_step("callback.advance_animation", cursor_ms=state["cursor_ms"], end_ms=state["end_ms"]):
+            cursor_ms = clamp_ms(int(state["cursor_ms"]), lower, upper)
+            end_ms = clamp_ms(int(state["end_ms"]), lower, upper)
+            increment_ms = int(state["increment_ms"])
+            window_length_ms = int(state["window_length_ms"])
+            if cursor_ms >= end_ms:
+                frame_start_ms = max(lower, end_ms - window_length_ms)
+                LOGGER.info("animation finished frame=%s..%s", format_utc_ms(frame_start_ms), format_utc_ms(end_ms))
+                return [frame_start_ms, end_ms], state, True, "finished"
 
-        frame_end_ms = min(cursor_ms + window_length_ms, end_ms)
-        next_cursor_ms = cursor_ms + increment_ms
-        next_state = {
-            "cursor_ms": next_cursor_ms,
-            "end_ms": end_ms,
-            "increment_ms": increment_ms,
-            "window_length_ms": window_length_ms,
-        }
-        disabled = frame_end_ms >= end_ms
-        status = "finished" if disabled else f"running: {format_utc_ms(cursor_ms)} -> {format_utc_ms(frame_end_ms)}"
-        return [cursor_ms, frame_end_ms], next_state, disabled, status
+            frame_end_ms = min(cursor_ms + window_length_ms, end_ms)
+            next_cursor_ms = cursor_ms + increment_ms
+            next_state = {
+                "cursor_ms": next_cursor_ms,
+                "end_ms": end_ms,
+                "increment_ms": increment_ms,
+                "window_length_ms": window_length_ms,
+            }
+            disabled = frame_end_ms >= end_ms
+            status = "finished" if disabled else f"running: {format_utc_ms(cursor_ms)} -> {format_utc_ms(frame_end_ms)}"
+            LOGGER.info("animation frame=%s..%s disabled=%s", format_utc_ms(cursor_ms), format_utc_ms(frame_end_ms), disabled)
+            return [cursor_ms, frame_end_ms], next_state, disabled, status
 
     @app.callback(
         Output("summary", "children"),
         Output("view-content", "children"),
+        Input("segment", "value"),
         Input("instrument", "value"),
         Input("time-range", "value"),
         Input("depth-levels", "value"),
         Input("view", "value"),
     )
-    def update_view(instrument: list[str] | str, time_range: list[int], depth_levels: int, view: str):
-        try:
-            instruments = selected_instruments(instrument)
-            summary = (
-                render_summary(catalog_key, instruments[0], time_range)
-                if len(instruments) == 1
-                else html.Div(
-                    [render_summary(catalog_key, value, time_range) for value in instruments],
-                    className="instrument-stack",
-                )
-            )
-
-            if view == "price":
-                if len(instruments) == 1:
-                    content = html.Div(
-                        [
-                            dcc.Graph(
-                                figure=render_price_figure(catalog_key, instruments[0], time_range),
-                                config={"displaylogo": False},
-                            ),
-                            dcc.Graph(
-                                figure=render_depth_figure(catalog_key, instruments[0], time_range, depth_levels, height=520),
-                                config={"displaylogo": False},
-                            ),
-                        ],
-                        className="price-depth-grid",
+    def update_view(segment_key: str, instrument: list[str] | str, time_range: list[int], depth_levels: int, view: str):
+        with log_step(
+            "callback.update_view",
+            segment=segment_key,
+            instrument=instrument,
+            view=view,
+            start=format_utc_ms(time_range[0]),
+            end=format_utc_ms(time_range[1]),
+            depth_levels=depth_levels,
+        ):
+            try:
+                instruments = selected_instruments(instrument)
+                LOGGER.info("render view=%s segment=%s instruments=%s", view, segment_key, ",".join(instruments))
+                summary = (
+                    render_summary(catalog_key, instruments[0], segment_key, time_range)
+                    if len(instruments) == 1
+                    else html.Div(
+                        [render_summary(catalog_key, value, segment_key, time_range) for value in instruments],
+                        className="instrument-stack",
                     )
-                else:
+                )
+
+                if view == "price":
+                    if len(instruments) == 1:
+                        content = html.Div(
+                            [
+                                dcc.Graph(
+                                    figure=render_price_figure(catalog_key, instruments[0], segment_key, time_range),
+                                    config={"displaylogo": False},
+                                ),
+                                dcc.Graph(
+                                    figure=render_depth_figure(catalog_key, instruments[0], segment_key, time_range, depth_levels, height=520),
+                                    config={"displaylogo": False},
+                                ),
+                            ],
+                            className="price-depth-grid",
+                        )
+                    else:
+                        content = html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        dcc.Graph(
+                                            figure=render_price_figure(catalog_key, value, segment_key, time_range),
+                                            config={"displaylogo": False},
+                                        ),
+                                        dcc.Graph(
+                                            figure=render_depth_figure(catalog_key, value, segment_key, time_range, depth_levels, height=520),
+                                            config={"displaylogo": False},
+                                        ),
+                                    ],
+                                    className="price-depth-grid",
+                                )
+                                for value in instruments
+                            ],
+                            className="instrument-stack",
+                        )
+                elif view == "microstructure":
                     content = html.Div(
                         [
-                            dcc.Graph(
-                                figure=render_price_stack_figure(catalog_key, instruments, time_range),
-                                config={"displaylogo": False},
-                            ),
-                            html.Div(
-                                [
-                                    dcc.Graph(
-                                        figure=render_depth_figure(catalog_key, value, time_range, depth_levels, height=420),
-                                        config={"displaylogo": False},
-                                    )
-                                    for value in instruments
-                                ],
-                                className="instrument-stack",
-                            ),
+                            dcc.Graph(figure=render_microstructure_figure(catalog_key, value, segment_key, time_range), config={"displaylogo": False})
+                            for value in instruments
                         ],
                         className="instrument-stack",
                     )
-            elif view == "microstructure":
-                content = html.Div(
-                    [
-                        dcc.Graph(figure=render_microstructure_figure(catalog_key, value, time_range), config={"displaylogo": False})
-                        for value in instruments
-                    ],
-                    className="instrument-stack",
-                )
-            elif view == "activity":
-                content = html.Div(
-                    [
-                        dcc.Graph(figure=render_activity_figure(catalog_key, value, time_range), config={"displaylogo": False})
-                        for value in instruments
-                    ],
-                    className="instrument-stack",
-                )
-            elif view == "depth":
-                content = html.Div(
-                    [
-                        dcc.Graph(figure=render_depth_figure(catalog_key, value, time_range, depth_levels), config={"displaylogo": False})
-                        for value in instruments
-                    ],
-                    className="instrument-stack",
-                )
-            elif view == "tables":
-                content = (
-                    render_tables(catalog_key, instruments[0], time_range)
-                    if len(instruments) == 1
-                    else dcc.Tabs(
+                elif view == "activity":
+                    content = html.Div(
                         [
-                            dcc.Tab(label=value, children=render_tables(catalog_key, value, time_range))
+                            dcc.Graph(figure=render_activity_figure(catalog_key, value, segment_key, time_range), config={"displaylogo": False})
                             for value in instruments
-                        ]
+                        ],
+                        className="instrument-stack",
                     )
-                )
-            else:
-                raise ValueError(f"Unexpected view: {view}")
-        except ValueError as error:
-            summary = html.Div()
-            content = dcc.Graph(figure=empty_figure(str(error)), config={"displaylogo": False})
-        return summary, content
+                elif view == "depth":
+                    content = html.Div(
+                        [
+                            dcc.Graph(figure=render_depth_figure(catalog_key, value, segment_key, time_range, depth_levels), config={"displaylogo": False})
+                            for value in instruments
+                        ],
+                        className="instrument-stack",
+                    )
+                elif view == "tables":
+                    content = (
+                        render_tables(catalog_key, instruments[0], segment_key, time_range)
+                        if len(instruments) == 1
+                        else dcc.Tabs(
+                            [
+                                dcc.Tab(label=value, children=render_tables(catalog_key, value, segment_key, time_range))
+                                for value in instruments
+                            ]
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unexpected view: {view}")
+            except ValueError as error:
+                LOGGER.info("render error=%s", error)
+                summary = html.Div()
+                content = dcc.Graph(figure=empty_figure(str(error)), config={"displaylogo": False})
+            return summary, content
 
     return app
 
@@ -894,11 +1073,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    LOGGER.info("starting catalog panel catalog=%s host=%s port=%d debug=%s", args.catalog, args.host, args.port, args.debug)
     build_app(args.catalog).run(host=args.host, port=args.port, debug=args.debug)
 
 

@@ -1,3 +1,6 @@
+import logging
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -7,47 +10,144 @@ import pyarrow.parquet as pq
 FIXED_SCALAR = 10**16
 DEPTH_LEVELS = 10
 DATA_TYPES = ("order_book_deltas", "quote_tick", "trade_tick")
+RECONSTRUCT_DATA_TYPE = "reconstruct"
 ACTION_ADD = 1
 ACTION_UPDATE = 2
 ACTION_DELETE = 3
 ACTION_CLEAR = 4
 SIDE_BUY = 1
 SIDE_SELL = 2
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CatalogSegment:
+    start: pd.Timestamp
+    end: pd.Timestamp
+
+    @property
+    def key(self) -> str:
+        return f"{timestamp_key(self.start)}_{timestamp_key(self.end)}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.start.strftime('%Y-%m-%d %H:%M:%S')} -> {self.end.strftime('%H:%M:%S')} UTC"
+
+
+def timestamp_key(value: pd.Timestamp) -> str:
+    timestamp = value.tz_convert("UTC") if value.tzinfo is not None else value.tz_localize("UTC")
+    fraction = f"{timestamp.microsecond:06d}{timestamp.nanosecond:03d}"
+    return f"{timestamp.strftime('%Y-%m-%dT%H-%M-%S')}-{fraction}Z"
+
+
+def parse_catalog_timestamp(value: str) -> pd.Timestamp:
+    date, time_value = value.split("T", maxsplit=1)
+    hour, minute, second, fraction = time_value.rstrip("Z").split("-", maxsplit=3)
+    padded_fraction = (fraction + "0" * 9)[:9]
+    return pd.Timestamp(f"{date}T{hour}:{minute}:{second}.{padded_fraction}Z")
+
+
+def parse_catalog_file_segment(path: Path) -> CatalogSegment:
+    start_value, end_value = path.stem.split("_", maxsplit=1)
+    return CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
+
+
+def segments_overlap(left: CatalogSegment, right: CatalogSegment) -> bool:
+    return left.start <= right.end and right.start <= left.end
+
+
+def discover_segments(catalog: Path) -> list[CatalogSegment]:
+    started = time.perf_counter()
+    intervals: list[CatalogSegment] = []
+    for instrument in discover_instruments(catalog):
+        directory = catalog / "data" / "order_book_deltas" / instrument
+        for path in sorted(directory.glob("*.parquet")):
+            intervals.append(parse_catalog_file_segment(path))
+    if not intervals:
+        raise FileNotFoundError(f"No parquet segments found under {catalog / 'data' / 'order_book_deltas'}")
+
+    merged: list[CatalogSegment] = []
+    for interval in sorted(intervals, key=lambda value: value.start):
+        if not merged or interval.start > merged[-1].end:
+            merged.append(interval)
+        else:
+            merged[-1] = CatalogSegment(merged[-1].start, max(merged[-1].end, interval.end))
+
+    LOGGER.info("catalog segments discovered count=%d elapsed=%.3fs", len(merged), time.perf_counter() - started)
+    return merged
 
 
 def discover_instruments(catalog: Path) -> list[str]:
+    started = time.perf_counter()
     data_root = catalog / "data"
     if not data_root.exists():
         raise FileNotFoundError(f"Catalog data directory does not exist: {data_root}")
 
     instrument_sets = []
     for data_type in DATA_TYPES:
+        type_started = time.perf_counter()
         directory = data_root / data_type
         if not directory.exists():
             raise FileNotFoundError(f"Catalog data type directory does not exist: {directory}")
-        instrument_sets.append({path.name for path in directory.iterdir() if path.is_dir()})
+        instruments = {path.name for path in directory.iterdir() if path.is_dir()}
+        LOGGER.info(
+            "catalog discovery data_type=%s instruments=%d elapsed=%.3fs",
+            data_type,
+            len(instruments),
+            time.perf_counter() - type_started,
+        )
+        instrument_sets.append(instruments)
 
     instruments = sorted(set.intersection(*instrument_sets))
     if not instruments:
         raise FileNotFoundError(f"No instruments with all required data types: {', '.join(DATA_TYPES)}")
+    LOGGER.info("catalog discovery complete instruments=%d elapsed=%.3fs", len(instruments), time.perf_counter() - started)
     return instruments
 
 
-def read_catalog_type(catalog: Path, data_type: str, instrument: str) -> pd.DataFrame:
+def _read_catalog_type(catalog: Path, data_type: str, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
     directory = catalog / "data" / data_type / instrument
     files = sorted(directory.glob("*.parquet"))
+    if segment_key is not None:
+        start_value, end_value = segment_key.split("_", maxsplit=1)
+        segment = CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
+        files = [path for path in files if segments_overlap(parse_catalog_file_segment(path), segment)]
     if not files:
-        raise FileNotFoundError(f"No parquet files found under {directory}")
+        segment_detail = f" for segment {segment_key}" if segment_key is not None else ""
+        raise FileNotFoundError(f"No parquet files found under {directory}{segment_detail}")
 
+    LOGGER.info("read catalog type start data_type=%s instrument=%s segment=%s files=%d", data_type, instrument, segment_key, len(files))
     frames = []
     for file_index, path in enumerate(files):
+        file_started = time.perf_counter()
         table = pq.read_table(path)
         frame = table.to_pandas()
         frame["_file_index"] = file_index
         frame["_row"] = range(len(frame))
         frames.append(frame)
+        LOGGER.info(
+            "read parquet data_type=%s instrument=%s segment=%s file=%d/%d rows=%d path=%s elapsed=%.3fs",
+            data_type,
+            instrument,
+            segment_key,
+            file_index + 1,
+            len(files),
+            len(frame),
+            path,
+            time.perf_counter() - file_started,
+        )
 
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    LOGGER.info(
+        "read catalog type done data_type=%s instrument=%s segment=%s rows=%d elapsed=%.3fs",
+        data_type,
+        instrument,
+        segment_key,
+        len(result),
+        time.perf_counter() - started,
+    )
+    return result
 
 
 def fixed_to_float(value: bytes, signed: bool) -> float:
@@ -64,16 +164,20 @@ def add_datetime(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def load_deltas(catalog: Path, instrument: str) -> pd.DataFrame:
-    deltas = read_catalog_type(catalog, "order_book_deltas", instrument)
+def load_deltas(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
+    deltas = _read_catalog_type(catalog, "order_book_deltas", instrument, segment_key)
     deltas["price_f"] = decode_fixed_column(deltas["price"], signed=True)
     deltas["size_f"] = decode_fixed_column(deltas["size"], signed=False)
     deltas = add_datetime(deltas)
-    return deltas.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    result = deltas.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    LOGGER.info("load deltas done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+    return result
 
 
-def load_quotes(catalog: Path, instrument: str) -> pd.DataFrame:
-    quotes = read_catalog_type(catalog, "quote_tick", instrument)
+def load_quotes(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
+    quotes = _read_catalog_type(catalog, "quote_tick", instrument, segment_key)
     quotes["bid_price_f"] = decode_fixed_column(quotes["bid_price"], signed=True)
     quotes["ask_price_f"] = decode_fixed_column(quotes["ask_price"], signed=True)
     quotes["bid_size_f"] = decode_fixed_column(quotes["bid_size"], signed=False)
@@ -82,92 +186,63 @@ def load_quotes(catalog: Path, instrument: str) -> pd.DataFrame:
     quotes["spread_f"] = quotes["ask_price_f"] - quotes["bid_price_f"]
     quotes["spread_bps"] = quotes["spread_f"] / quotes["mid_f"] * 10_000.0
     quotes = add_datetime(quotes)
-    return quotes.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    result = quotes.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    LOGGER.info("load quotes done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+    return result
 
 
-def load_trades(catalog: Path, instrument: str) -> pd.DataFrame:
-    trades = read_catalog_type(catalog, "trade_tick", instrument)
+def load_trades(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
+    trades = _read_catalog_type(catalog, "trade_tick", instrument, segment_key)
     trades["price_f"] = decode_fixed_column(trades["price"], signed=True)
     trades["size_f"] = decode_fixed_column(trades["size"], signed=False)
     trades = add_datetime(trades)
-    return trades.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    result = trades.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    LOGGER.info("load trades done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+    return result
 
 
-def load_depths(catalog: Path, instrument: str) -> pd.DataFrame:
+def load_depths(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
     try:
-        depths = read_catalog_type(catalog, "order_book_depths", instrument)
+        depths = _read_catalog_type(catalog, "order_book_depths", instrument, segment_key)
     except FileNotFoundError:
-        return reconstruct_depths(load_deltas(catalog, instrument))
+        LOGGER.info("order_book_depths missing instrument=%s segment=%s; loading reconstructed cache", instrument, segment_key)
+        result = load_reconstructed_depths(catalog, instrument, segment_key)
+        LOGGER.info("load reconstructed depths done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+        return result
 
     for side in ("bid", "ask"):
         for level in range(DEPTH_LEVELS):
             depths[f"{side}_price_{level}_f"] = decode_fixed_column(depths[f"{side}_price_{level}"], signed=True)
             depths[f"{side}_size_{level}_f"] = decode_fixed_column(depths[f"{side}_size_{level}"], signed=False)
     depths = add_datetime(depths)
-    return depths.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    result = depths.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    LOGGER.info("load depths done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+    return result
 
 
-def reconstruct_depths(deltas: pd.DataFrame) -> pd.DataFrame:
-    bids: dict[float, float] = {}
-    asks: dict[float, float] = {}
-    rows = []
+def reconstructed_depths_path(catalog: Path, instrument: str, segment_key: str | None) -> Path:
+    file_name = f"{segment_key}.parquet" if segment_key is not None else "depths.parquet"
+    return catalog / "data" / RECONSTRUCT_DATA_TYPE / instrument / file_name
 
-    for _, row in deltas.iterrows():
-        action = int(row["action"])
-        side = int(row["side"])
-        price = float(row["price_f"])
-        size = float(row["size_f"])
 
-        if action == ACTION_CLEAR:
-            bids.clear()
-            asks.clear()
-        elif action in (ACTION_ADD, ACTION_UPDATE):
-            book = bids if side == SIDE_BUY else asks if side == SIDE_SELL else None
-            if book is None:
-                raise ValueError(f"Unexpected side={side} for action={action}")
-            if size <= 0.0:
-                book.pop(price, None)
-            else:
-                book[price] = size
-        elif action == ACTION_DELETE:
-            book = bids if side == SIDE_BUY else asks if side == SIDE_SELL else None
-            if book is None:
-                raise ValueError(f"Unexpected side={side} for delete")
-            book.pop(price, None)
-        else:
-            raise ValueError(f"Unexpected action={action}")
+def load_reconstructed_depths(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
+    started = time.perf_counter()
+    path = reconstructed_depths_path(catalog, instrument, segment_key)
+    if not path.exists():
+        raise FileNotFoundError(f"No reconstructed depth cache found: {path}. Run scripts/convert.py for the live instance first.")
 
-        if not bids or not asks:
-            continue
-
-        bid_levels = sorted(bids.items(), reverse=True)[:DEPTH_LEVELS]
-        ask_levels = sorted(asks.items())[:DEPTH_LEVELS]
-        depth_row = {
-            "dt": row["dt"],
-            "ts_event": row["ts_event"],
-            "ts_init": row["ts_init"],
-            "_file_index": row["_file_index"],
-            "_row": row["_row"],
-            "source": "reconstructed_from_deltas",
-        }
-        for level in range(DEPTH_LEVELS):
-            bid_price, bid_size = bid_levels[level] if level < len(bid_levels) else (float("nan"), 0.0)
-            ask_price, ask_size = ask_levels[level] if level < len(ask_levels) else (float("nan"), 0.0)
-            depth_row[f"bid_price_{level}_f"] = bid_price
-            depth_row[f"bid_size_{level}_f"] = bid_size
-            depth_row[f"ask_price_{level}_f"] = ask_price
-            depth_row[f"ask_size_{level}_f"] = ask_size
-            depth_row[f"bid_count_{level}"] = 1 if level < len(bid_levels) else 0
-            depth_row[f"ask_count_{level}"] = 1 if level < len(ask_levels) else 0
-        rows.append(depth_row)
-
-    if not rows:
-        raise ValueError("No valid depth snapshots reconstructed from order book deltas")
-
-    return pd.DataFrame(rows).reset_index(drop=True)
+    LOGGER.info("read reconstructed depths start instrument=%s segment=%s path=%s", instrument, segment_key, path)
+    depths = pd.read_parquet(path)
+    depths["dt"] = pd.to_datetime(depths["dt"], utc=True)
+    result = depths.sort_values(["ts_init", "_file_index", "_row"], kind="stable").reset_index(drop=True)
+    LOGGER.info("read reconstructed depths done instrument=%s segment=%s rows=%d elapsed=%.3fs", instrument, segment_key, len(result), time.perf_counter() - started)
+    return result
 
 
 def depths_to_top(depths: pd.DataFrame) -> pd.DataFrame:
+    started = time.perf_counter()
     top = depths[["dt", "ts_event", "ts_init", "bid_price_0_f", "ask_price_0_f", "bid_size_0_f", "ask_size_0_f"]].copy()
     top = top.rename(
         columns={
@@ -187,10 +262,13 @@ def depths_to_top(depths: pd.DataFrame) -> pd.DataFrame:
     top["top_imbalance"] = (top["bid_size"] - top["ask_size"]) / (top["bid_size"] + top["ask_size"])
     top["bid_levels"] = depths.loc[top.index, [f"bid_count_{level}" for level in range(DEPTH_LEVELS)]].gt(0).sum(axis=1)
     top["ask_levels"] = depths.loc[top.index, [f"ask_count_{level}" for level in range(DEPTH_LEVELS)]].gt(0).sum(axis=1)
-    return top.reset_index(drop=True)
+    result = top.reset_index(drop=True)
+    LOGGER.info("depths to top done depth_rows=%d top_rows=%d elapsed=%.3fs", len(depths), len(result), time.perf_counter() - started)
+    return result
 
 
 def depth_snapshot_to_long(depths: pd.DataFrame, row_index: int = -1) -> pd.DataFrame:
+    started = time.perf_counter()
     if depths.empty:
         raise ValueError("Cannot convert empty depth data")
 
@@ -206,4 +284,6 @@ def depth_snapshot_to_long(depths: pd.DataFrame, row_index: int = -1) -> pd.Data
 
     if not rows:
         raise ValueError("No valid levels in depth snapshot")
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    LOGGER.info("depth snapshot to long done input_rows=%d output_rows=%d elapsed=%.3fs", len(depths), len(result), time.perf_counter() - started)
+    return result
