@@ -1,3 +1,0 @@
-pub const DEFAULT_INSTRUMENT: &str = "BTC-USD-PERP.HYPERLIQUID";
-pub const DEFAULT_CATALOG_DIR: &str = "catalog";
-pub const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 250;

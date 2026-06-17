@@ -18,6 +18,8 @@ from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.events import OrderCanceled
+from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
@@ -69,6 +71,8 @@ class AvellanedaStoikovMarketMaker(Strategy):
         self.book: OrderBook | None = None
         self.buy_order: LimitOrder | None = None
         self.sell_order: LimitOrder | None = None
+        self._pending_quote: tuple[float, float, float, float] | None = None
+        self.quote_records: list[dict[str, float | int]] = []
         self._last_mid: float | None = None
         self._last_quote_ts: int | None = None
         self._returns: deque[float] = deque(maxlen=config.sigma_window)
@@ -167,16 +171,50 @@ class AvellanedaStoikovMarketMaker(Strategy):
                 bid_size = 0.0
             elif trend_signal > 0.0:
                 ask_size = 0.0
+        self.quote_records.append(
+            {
+                "ts_event": ts_event,
+                "bid": bid_f,
+                "ask": ask_f,
+                "mid": mid,
+                "bid_quote": bid_quote,
+                "ask_quote": ask_quote,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "inventory": inventory,
+                "sigma": sigma,
+                "alpha": alpha,
+            },
+        )
         self._replace_quotes(bid_quote, ask_quote, bid_size, ask_size)
 
     def _replace_quotes(self, bid_quote: float, ask_quote: float, bid_size: float, ask_size: float) -> None:
         if self.instrument is None:
             raise RuntimeError("Instrument is not initialized")
 
+        self._pending_quote = (bid_quote, ask_quote, bid_size, ask_size)
+        canceling = False
         if self.buy_order is not None and self.buy_order.is_open:
-            self.cancel_order(self.buy_order)
+            canceling = True
+            if not self.buy_order.is_pending_cancel:
+                self.cancel_order(self.buy_order)
         if self.sell_order is not None and self.sell_order.is_open:
-            self.cancel_order(self.sell_order)
+            canceling = True
+            if not self.sell_order.is_pending_cancel:
+                self.cancel_order(self.sell_order)
+        if canceling:
+            return
+
+        self._submit_pending_quote()
+
+    def _submit_pending_quote(self) -> None:
+        if self.instrument is None:
+            raise RuntimeError("Instrument is not initialized")
+        if self._pending_quote is None:
+            return
+
+        bid_quote, ask_quote, bid_size, ask_size = self._pending_quote
+        self._pending_quote = None
 
         min_qty = self.instrument.min_quantity.as_double()
         if bid_size >= min_qty:
@@ -203,6 +241,25 @@ class AvellanedaStoikovMarketMaker(Strategy):
             )
             self.submit_order(self.sell_order)
         else:
+            self.sell_order = None
+
+    def _submit_pending_quote_if_flat(self) -> None:
+        buy_live = self.buy_order is not None and self.buy_order.is_open
+        sell_live = self.sell_order is not None and self.sell_order.is_open
+        if not buy_live and not sell_live:
+            self._submit_pending_quote()
+
+    def on_order_canceled(self, event: OrderCanceled) -> None:
+        if self.buy_order is not None and event.client_order_id == self.buy_order.client_order_id:
+            self.buy_order = None
+        if self.sell_order is not None and event.client_order_id == self.sell_order.client_order_id:
+            self.sell_order = None
+        self._submit_pending_quote_if_flat()
+
+    def on_order_denied(self, event: OrderDenied) -> None:
+        if self.buy_order is not None and event.client_order_id == self.buy_order.client_order_id:
+            self.buy_order = None
+        if self.sell_order is not None and event.client_order_id == self.sell_order.client_order_id:
             self.sell_order = None
 
     def on_event(self, event: Event) -> None:
@@ -232,6 +289,8 @@ class AvellanedaStoikovMarketMaker(Strategy):
     def on_reset(self) -> None:
         self.buy_order = None
         self.sell_order = None
+        self._pending_quote = None
+        self.quote_records.clear()
         self._last_mid = None
         self._last_quote_ts = None
         self._returns.clear()

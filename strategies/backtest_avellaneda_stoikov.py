@@ -14,13 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from avellaneda_stoikov_market_making import AvellanedaStoikovMarketMaker
 from avellaneda_stoikov_market_making import AvellanedaStoikovMarketMakerConfig
-from data_utils import load_depths
-from data_utils import parse_catalog_file_segment
-from data_utils import segment_from_key
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.core.nautilus_pyo3 import BacktestEngine # type: ignore
+from data_utils import load_nautilus_backtest_data
+from data_utils import resolve_catalog_segment
+from visualize_backtest import visualize_backtest
+from nautilus_trader.backtest.engine import BacktestEngineConfig
+from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.config import LoggingConfig
-from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model import Money
 from nautilus_trader.model import TraderId
@@ -30,13 +29,11 @@ from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
-from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
 
 
 DEFAULT_CATALOG_PATH = Path("catalog")
@@ -87,114 +84,6 @@ def parse_args() -> argparse.Namespace:
     if args.min_5m_fills <= 0:
         raise ValueError("--min-5m-fills must be positive")
     return args
-
-
-def resolve_segment(catalog: Path, instrument: str, requested: str) -> str | None:
-    if requested == "all":
-        return None
-    if requested != "latest":
-        return requested
-
-    directory = catalog / "data" / "order_book_deltas" / instrument
-    if not directory.exists():
-        raise FileNotFoundError(f"No order_book_deltas directory: {directory}")
-    segments = [parse_catalog_file_segment(path) for path in directory.glob("*.parquet")]
-    if not segments:
-        raise FileNotFoundError(f"No order_book_deltas parquet files under {directory}")
-    return max(segments, key=lambda segment: segment.end).key
-
-
-def load_catalog_data(
-    catalog_path: Path,
-    instrument: str,
-    segment_key: str | None,
-    max_rows: int | None,
-    max_minutes: float | None,
-    book_data_type: str,
-) -> tuple[list[object], list[object], pd.Timestamp, pd.Timestamp]:
-    catalog = ParquetDataCatalog(str(catalog_path))
-    if book_data_type == "depth10":
-        book_data = load_depth10_data(catalog_path, instrument, segment_key)
-    else:
-        query = {}
-        if segment_key is not None:
-            segment = segment_from_key(segment_key)
-            query["start"] = segment.start
-            query["end"] = segment.end
-        book_data = catalog.order_book_deltas([instrument], batched=True, **query)
-
-    if not book_data:
-        raise ValueError(f"No {book_data_type} book data loaded for {instrument} segment={segment_key or 'all'}")
-    if max_minutes is not None:
-        cutoff_ns = book_data[0].ts_event + int(max_minutes * 60.0 * 1_000_000_000)
-        book_data = [batch for batch in book_data if batch.ts_event <= cutoff_ns]
-        if not book_data:
-            raise ValueError(f"No book data loaded within --max-minutes={max_minutes}")
-    if max_rows is not None:
-        book_data = book_data[:max_rows]
-
-    start = pd.Timestamp(book_data[0].ts_event, unit="ns", tz="UTC")
-    end = pd.Timestamp(book_data[-1].ts_event, unit="ns", tz="UTC")
-    trades = catalog.trade_ticks([instrument], start=start, end=end)
-    return book_data, trades, start, end
-
-
-def load_depth10_data(catalog_path: Path, instrument: str, segment_key: str | None) -> list[OrderBookDepth10]:
-    instrument_id = InstrumentId.from_str(instrument)
-    depths = load_depths(catalog_path, instrument, segment_key)
-    depths = depths.sort_values(["ts_init", "_cache_file_index", "_file_index", "_row"], kind="stable")
-    depths = depths.groupby("ts_event", sort=False).tail(1).reset_index(drop=True)
-    depths = depths[
-        (depths["bid_price_0_f"] > 0.0)
-        & (depths["ask_price_0_f"] > 0.0)
-        & (depths["bid_price_0_f"] < depths["ask_price_0_f"])
-    ].reset_index(drop=True)
-    if depths.empty:
-        raise ValueError(f"No valid depth10 top-of-book rows for {instrument} segment={segment_key or 'all'}")
-
-    empty_bid = BookOrder(OrderSide.NO_ORDER_SIDE, Price(0, precision=8), Quantity(0, precision=8), 0)
-    empty_ask = BookOrder(OrderSide.NO_ORDER_SIDE, Price(0, precision=8), Quantity(0, precision=8), 0)
-    data: list[OrderBookDepth10] = []
-    for sequence, row in enumerate(depths.itertuples(index=False)):
-        bids = []
-        asks = []
-        bid_counts = []
-        ask_counts = []
-        for level in range(10):
-            bid_price = getattr(row, f"bid_price_{level}_f")
-            bid_size = getattr(row, f"bid_size_{level}_f")
-            bid_count = int(getattr(row, f"bid_count_{level}"))
-            if bid_count > 0 and pd.notna(bid_price) and pd.notna(bid_size) and bid_price > 0.0 and bid_size > 0.0:
-                bids.append(BookOrder(OrderSide.BUY, Price(float(bid_price), precision=8), Quantity(float(bid_size), precision=8), 0))
-                bid_counts.append(bid_count)
-            else:
-                bids.append(empty_bid)
-                bid_counts.append(0)
-
-            ask_price = getattr(row, f"ask_price_{level}_f")
-            ask_size = getattr(row, f"ask_size_{level}_f")
-            ask_count = int(getattr(row, f"ask_count_{level}"))
-            if ask_count > 0 and pd.notna(ask_price) and pd.notna(ask_size) and ask_price > 0.0 and ask_size > 0.0:
-                asks.append(BookOrder(OrderSide.SELL, Price(float(ask_price), precision=8), Quantity(float(ask_size), precision=8), 0))
-                ask_counts.append(ask_count)
-            else:
-                asks.append(empty_ask)
-                ask_counts.append(0)
-
-        data.append(
-            OrderBookDepth10(
-                instrument_id=instrument_id,
-                bids=bids,
-                asks=asks,
-                bid_counts=bid_counts,
-                ask_counts=ask_counts,
-                flags=0,
-                sequence=sequence,
-                ts_event=int(row.ts_event),
-                ts_init=int(row.ts_init),
-            ),
-        )
-    return data
 
 
 def build_instrument(instrument: str):
@@ -261,6 +150,15 @@ def file_token(value: float | int | str) -> str:
     return str(value).replace(".", "p").replace("-", "m").replace("/", "")
 
 
+def make_run_dir(report_dir: Path) -> Path:
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    run_dir = report_dir / timestamp
+    if run_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {run_dir}")
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
 def fill_metrics(fills_report: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[int, int]:
     window = pd.Timedelta(minutes=5)
     window_count = int((end - start) / window)
@@ -287,12 +185,19 @@ def money_as_float(value) -> float:
     return value.as_double()
 
 
+def initial_mark_price(book_data: list[object]) -> float:
+    first = book_data[0]
+    if not isinstance(first, OrderBookDepth10):
+        raise TypeError(f"Expected OrderBookDepth10, got {type(first).__name__}")
+    return (first.bids[0].price.as_double() + first.asks[0].price.as_double()) / 2.0
+
+
 def main() -> None:
     args = parse_args()
     catalog_path = args.catalog.expanduser()
-    segment_key = resolve_segment(catalog_path, args.instrument, args.segment)
+    segment_key = resolve_catalog_segment(catalog_path, args.instrument, args.segment)
     instrument = build_instrument_with_fees(args.instrument, Decimal(args.maker_fee), Decimal(args.taker_fee))
-    book_data, trades, start, end = load_catalog_data(
+    book_data, trades, start, end = load_nautilus_backtest_data(
         catalog_path,
         args.instrument,
         segment_key,
@@ -313,6 +218,13 @@ def main() -> None:
         if account_type == AccountType.MARGIN
         else [Money(args.starting_cash, USDT), Money(args.starting_base, BTC)]
     )
+    initial_balances = (
+        {"USDT": args.starting_cash}
+        if account_type == AccountType.MARGIN
+        else {"USDT": args.starting_cash, "BTC": args.starting_base}
+    )
+    first_mid = initial_mark_price(book_data)
+    initial_equity = initial_balances.get("USDT", 0.0) + initial_balances.get("BTC", 0.0) * first_mid
     engine.add_venue(
         venue=venue,
         oms_type=OmsType.NETTING,
@@ -363,7 +275,7 @@ def main() -> None:
     passes_fill_rate = min_5m_fills >= args.min_5m_fills
     passes_pnl = portfolio_pnl > 0.0
 
-    args.report_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir(args.report_dir.expanduser())
     params = (
         f"g{file_token(args.gamma)}"
         f"_k{file_token(args.kappa)}"
@@ -382,15 +294,27 @@ def main() -> None:
         f"_{args.account_type.lower()}"
     )
     label = f"{args.instrument}_{segment_key or 'all'}_{params}".replace("/", "").replace(":", "")
-    account_path = args.report_dir / f"{label}_account.csv"
-    fills_path = args.report_dir / f"{label}_fills.csv"
-    positions_path = args.report_dir / f"{label}_positions.csv"
+    account_path = run_dir / f"{label}_account.csv"
+    fills_path = run_dir / f"{label}_fills.csv"
+    positions_path = run_dir / f"{label}_positions.csv"
     account_report.to_csv(account_path)
     fills_report.to_csv(fills_path)
     positions_report.to_csv(positions_path)
-    metrics_path = args.report_dir / f"{label}_metrics.csv"
+    visualization_paths = visualize_backtest(
+        book_data=book_data,
+        trades=trades,
+        quote_records=strategy.quote_records,
+        fills_report=fills_report,
+        account_report=account_report,
+        positions_report=positions_report,
+        output_dir=run_dir,
+        label=label,
+        initial_balances=initial_balances,
+    )
+    metrics_path = run_dir / f"{label}_metrics.csv"
     pd.Series(
         {
+            "run_dir": run_dir,
             "instrument": args.instrument,
             "segment": segment_key or "all",
             "start": start,
@@ -410,11 +334,25 @@ def main() -> None:
             "trend_size_weight": args.trend_size_weight,
             "account_type": args.account_type,
             "allow_cash_borrowing": args.allow_cash_borrowing,
+            "starting_cash": args.starting_cash,
+            "starting_base": args.starting_base if account_type == AccountType.CASH else 0.0,
+            "initial_mark_price": first_mid,
+            "initial_equity_usdt": initial_equity,
+            "quotes_path": visualization_paths["quotes_path"],
+            "pnl_path": visualization_paths["pnl_path"],
+            "stats_path": visualization_paths["stats_path"],
+            "report_html_path": visualization_paths["report_html_path"],
+            "time_price_quote_path": visualization_paths["time_price_quote_path"],
+            "trade_path": visualization_paths["trade_path"],
+            "pnl_plot_path": visualization_paths["pnl_plot_path"],
         },
     ).to_frame("value").to_csv(metrics_path)
 
     print(f"instrument={args.instrument}")
     print(f"segment={segment_key or 'all'}")
+    print(f"initial_balances={initial_balances}")
+    print(f"initial_mark_price={first_mid:.8f}")
+    print(f"initial_equity_usdt={initial_equity:.8f}")
     print(f"start={start}")
     print(f"end={end}")
     print(f"book_data_type={args.book_data_type}")
@@ -429,9 +367,17 @@ def main() -> None:
     print(f"passes_pnl={passes_pnl}")
     print(f"passes_all={passes_duration and passes_fill_rate and passes_pnl}")
     print(f"positions={len(positions_report)}")
+    print(f"run_dir={run_dir}")
     print(f"account_path={account_path}")
     print(f"fills_path={fills_path}")
     print(f"positions_path={positions_path}")
+    print(f"quotes_path={visualization_paths['quotes_path']}")
+    print(f"pnl_path={visualization_paths['pnl_path']}")
+    print(f"stats_path={visualization_paths['stats_path']}")
+    print(f"report_html_path={visualization_paths['report_html_path']}")
+    print(f"time_price_quote_path={visualization_paths['time_price_quote_path']}")
+    print(f"trade_path={visualization_paths['trade_path']}")
+    print(f"pnl_plot_path={visualization_paths['pnl_plot_path']}")
     print(f"metrics_path={metrics_path}")
 
 

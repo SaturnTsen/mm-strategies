@@ -5,6 +5,13 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 
 FIXED_SCALAR = 10**16
@@ -56,6 +63,116 @@ def parse_catalog_file_segment(path: Path) -> CatalogSegment:
 def segment_from_key(segment_key: str) -> CatalogSegment:
     start_value, end_value = segment_key.split("_", maxsplit=1)
     return CatalogSegment(parse_catalog_timestamp(start_value), parse_catalog_timestamp(end_value))
+
+
+def resolve_catalog_segment(catalog: Path, instrument: str, requested: str) -> str | None:
+    if requested == "all":
+        return None
+    if requested != "latest":
+        return requested
+
+    directory = catalog / "data" / "order_book_deltas" / instrument
+    if not directory.exists():
+        raise FileNotFoundError(f"No order_book_deltas directory: {directory}")
+    segments = [parse_catalog_file_segment(path) for path in directory.glob("*.parquet")]
+    if not segments:
+        raise FileNotFoundError(f"No order_book_deltas parquet files under {directory}")
+    return max(segments, key=lambda segment: segment.end).key
+
+
+def load_nautilus_backtest_data(
+    catalog_path: Path,
+    instrument: str,
+    segment_key: str | None,
+    max_rows: int | None,
+    max_minutes: float | None,
+    book_data_type: str,
+) -> tuple[list[object], list[object], pd.Timestamp, pd.Timestamp]:
+    catalog = ParquetDataCatalog(str(catalog_path))
+    if book_data_type == "depth10":
+        book_data = load_depth10_data(catalog_path, instrument, segment_key)
+    elif book_data_type == "deltas":
+        query = {}
+        if segment_key is not None:
+            segment = segment_from_key(segment_key)
+            query["start"] = segment.start
+            query["end"] = segment.end
+        book_data = catalog.order_book_deltas([instrument], batched=True, **query)
+    else:
+        raise ValueError("book_data_type must be depth10 or deltas")
+
+    if not book_data:
+        raise ValueError(f"No {book_data_type} book data loaded for {instrument} segment={segment_key or 'all'}")
+    if max_minutes is not None:
+        cutoff_ns = book_data[0].ts_event + int(max_minutes * 60.0 * 1_000_000_000)
+        book_data = [item for item in book_data if item.ts_event <= cutoff_ns]
+        if not book_data:
+            raise ValueError(f"No book data loaded within --max-minutes={max_minutes}")
+    if max_rows is not None:
+        book_data = book_data[:max_rows]
+
+    start = pd.Timestamp(book_data[0].ts_event, unit="ns", tz="UTC")
+    end = pd.Timestamp(book_data[-1].ts_event, unit="ns", tz="UTC")
+    trades = catalog.trade_ticks([instrument], start=start, end=end)
+    return book_data, trades, start, end
+
+
+def load_depth10_data(catalog_path: Path, instrument: str, segment_key: str | None) -> list[OrderBookDepth10]:
+    instrument_id = InstrumentId.from_str(instrument)
+    depths = load_depths(catalog_path, instrument, segment_key)
+    depths = depths.sort_values(["ts_init", "_cache_file_index", "_file_index", "_row"], kind="stable")
+    depths = depths.groupby("ts_event", sort=False).tail(1).reset_index(drop=True)
+    depths = depths[
+        (depths["bid_price_0_f"] > 0.0)
+        & (depths["ask_price_0_f"] > 0.0)
+        & (depths["bid_price_0_f"] < depths["ask_price_0_f"])
+    ].reset_index(drop=True)
+    if depths.empty:
+        raise ValueError(f"No valid depth10 top-of-book rows for {instrument} segment={segment_key or 'all'}")
+
+    empty_bid = BookOrder(OrderSide.NO_ORDER_SIDE, Price(0, precision=8), Quantity(0, precision=8), 0)
+    empty_ask = BookOrder(OrderSide.NO_ORDER_SIDE, Price(0, precision=8), Quantity(0, precision=8), 0)
+    data: list[OrderBookDepth10] = []
+    for sequence, row in enumerate(depths.itertuples(index=False)):
+        bids = []
+        asks = []
+        bid_counts = []
+        ask_counts = []
+        for level in range(DEPTH_LEVELS):
+            bid_price = getattr(row, f"bid_price_{level}_f")
+            bid_size = getattr(row, f"bid_size_{level}_f")
+            bid_count = int(getattr(row, f"bid_count_{level}"))
+            if bid_count > 0 and pd.notna(bid_price) and pd.notna(bid_size) and bid_price > 0.0 and bid_size > 0.0:
+                bids.append(BookOrder(OrderSide.BUY, Price(float(bid_price), precision=8), Quantity(float(bid_size), precision=8), 0))
+                bid_counts.append(bid_count)
+            else:
+                bids.append(empty_bid)
+                bid_counts.append(0)
+
+            ask_price = getattr(row, f"ask_price_{level}_f")
+            ask_size = getattr(row, f"ask_size_{level}_f")
+            ask_count = int(getattr(row, f"ask_count_{level}"))
+            if ask_count > 0 and pd.notna(ask_price) and pd.notna(ask_size) and ask_price > 0.0 and ask_size > 0.0:
+                asks.append(BookOrder(OrderSide.SELL, Price(float(ask_price), precision=8), Quantity(float(ask_size), precision=8), 0))
+                ask_counts.append(ask_count)
+            else:
+                asks.append(empty_ask)
+                ask_counts.append(0)
+
+        data.append(
+            OrderBookDepth10(
+                instrument_id=instrument_id,
+                bids=bids,
+                asks=asks,
+                bid_counts=bid_counts,
+                ask_counts=ask_counts,
+                flags=0,
+                sequence=sequence,
+                ts_event=int(row.ts_event),
+                ts_init=int(row.ts_init),
+            ),
+        )
+    return data
 
 
 def segments_overlap(left: CatalogSegment, right: CatalogSegment) -> bool:
