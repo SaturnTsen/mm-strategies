@@ -4,55 +4,47 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from pathlib import Path
 from threading import Timer
-from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from nautilus_trader.adapters.binance import (
-    BINANCE,
-    BinanceAccountType,
     BinanceDataClientConfig,
-    BinanceLiveDataClientFactory,
+    BinanceDataClientFactory,
+    BinanceProductType,
+    BinanceSpotMarketDataMode,
 )
 from nautilus_trader.adapters.bybit import (
-    BYBIT,
     BybitDataClientConfig,
-    BybitLiveDataClientFactory,
+    BybitDataClientFactory,
     BybitProductType,
 )
 from nautilus_trader.adapters.hyperliquid import (
-    HYPERLIQUID,
     HyperliquidDataClientConfig,
-    HyperliquidLiveDataClientFactory,
+    HyperliquidDataClientFactory,
 )
-from nautilus_trader.adapters.hyperliquid.enums import HyperliquidProductType
-from nautilus_trader.adapters.kraken import (
-    KRAKEN,
-    KrakenDataClientConfig,
-    KrakenLiveDataClientFactory,
-)
+from nautilus_trader.adapters.kraken import KrakenDataClientConfig, KrakenDataClientFactory
 from nautilus_trader.adapters.okx import (
     OKX,
     OKXDataClientConfig,
-    OKXLiveDataClientFactory,
+    OKXDataClientFactory,
+    OKXInstrumentType,
 )
-from nautilus_trader.common import Environment
-from nautilus_trader.common.config import CUSTOM_ENCODINGS
-from nautilus_trader.config import (
-    ImportableActorConfig,
-    InstrumentProviderConfig,
-    LoggingConfig,
-    StreamingConfig,
-    TradingNodeConfig,
-)
-from nautilus_trader.core.nautilus_pyo3.okx import OKXInstrumentType  # type: ignore
-from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.data import OrderBookDeltas, QuoteTick, TradeTick
-from nautilus_trader.model.identifiers import InstrumentId, TraderId
-from nautilus_trader.persistence.writer import RotationMode
+from nautilus_trader.common import Environment, LoggerConfig, LogLevel
+from nautilus_trader.live import LiveNode, RotationConfig, StreamingConfig
+from nautilus_trader.model import ActorId, ClientId, InstrumentId, TraderId
+from nautilus_trader.testkit import DataTesterConfig
 
 
+KRAKEN = "KRAKEN"
+BINANCE = "BINANCE"
+BYBIT = "BYBIT"
+HYPERLIQUID = "HYPERLIQUID"
 DEFAULT_CATALOG_PATH = Path("catalog")
 SUPPORTED_VENUE_INSTRUMENTS = {
     KRAKEN: ["BTC/USD.KRAKEN"],
@@ -68,13 +60,6 @@ DEFAULT_VENUE_INSTRUMENTS = {
     BYBIT: SUPPORTED_VENUE_INSTRUMENTS[BYBIT],
     HYPERLIQUID: SUPPORTED_VENUE_INSTRUMENTS[HYPERLIQUID],
 }
-STREAMING_DATA_TYPES = [
-    QuoteTick,
-    TradeTick,
-    OrderBookDeltas,
-]
-CUSTOM_ENCODINGS[type(OKXInstrumentType.SPOT)] = lambda value: value.value
-CUSTOM_ENCODINGS[type(BybitProductType.SPOT)] = lambda value: value.value
 
 def parse_record_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -105,10 +90,10 @@ def main() -> None:
     venue_instruments = parse_venue_instruments(args.instrument)
     catalog_path = args.catalog.expanduser()
     catalog_path.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Recording multi-venue market data to catalog: {catalog_path}")
 
     if args.build_only:
         node = build_recording_node(args, catalog_path, venue_instruments)
-        node.build()
         print(f"Built multi-venue data recorder. Catalog: {catalog_path}")
         return
 
@@ -117,13 +102,12 @@ def main() -> None:
     while remaining_minutes > 0.0:
         session_minutes = min(args.instance_minutes, remaining_minutes)
         node = build_recording_node(args, catalog_path, venue_instruments)
-        node.build()
         print(f"Starting recording session {session}: duration={session_minutes:g} minutes instance={node.instance_id}")
-        stop_timer = Timer(session_minutes * 60.0, stop_node, args=(node, session_minutes))
+        stop_timer = Timer(session_minutes * 60.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
         stop_timer.start()
 
         try:
-            node.run(raise_exception=True)
+            node.run()
         finally:
             stop_timer.cancel()
 
@@ -135,45 +119,106 @@ def build_recording_node(
     args: argparse.Namespace,
     catalog_path: Path,
     venue_instruments: dict[str, list[str]],
-) -> TradingNode:
-    node_config = TradingNodeConfig(
+) -> LiveNode:
+    builder = LiveNode.builder(
+        name="recorder",
         trader_id=TraderId(args.trader_id),
         environment=Environment.LIVE,
-        streaming=StreamingConfig(
+    ).with_logging(
+        LoggerConfig(stdout_level=LogLevel.from_str(args.log_level)),
+    ).with_streaming_config(
+        StreamingConfig(
             catalog_path=str(catalog_path),
             flush_interval_ms=args.flush_interval_ms,
-            include_types=STREAMING_DATA_TYPES,
-            rotation_mode=RotationMode.SIZE,
-            max_file_size=args.max_file_size,
             replace_existing=False,
+            rotation_config=RotationConfig.size(args.max_file_size),
         ),
-        logging=LoggingConfig(log_level=args.log_level),
-        data_clients=build_data_clients(args, venue_instruments),
-        actors=[
-            build_data_tester_config(args, venue, venue_values)
-            for venue, venue_values in venue_instruments.items()
-        ],
     )
 
-    node = TradingNode(config=node_config)
-    for venue, factory in {
-        KRAKEN: KrakenLiveDataClientFactory,
-        BINANCE: BinanceLiveDataClientFactory,
-        OKX: OKXLiveDataClientFactory,
-        BYBIT: BybitLiveDataClientFactory,
-        HYPERLIQUID: HyperliquidLiveDataClientFactory,
-    }.items():
-        if venue in venue_instruments:
-            node.add_data_client_factory(venue, factory)
+    if KRAKEN in venue_instruments:
+        builder.add_data_client(
+            KRAKEN,
+            KrakenDataClientFactory(),
+            KrakenDataClientConfig(
+                timeout_secs=args.http_timeout_secs,
+                proxy_url=args.proxy_url,
+            ),
+        )
+
+    if BINANCE in venue_instruments:
+        builder.add_data_client(
+            BINANCE,
+            BinanceDataClientFactory(),
+            BinanceDataClientConfig(
+                product_type=BinanceProductType.SPOT,
+                spot_market_data_mode=BinanceSpotMarketDataMode.Json,
+            ),
+        )
+
+    if OKX in venue_instruments:
+        missing = [
+            name
+            for name in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
+            if not os.getenv(name)
+        ]
+        if missing:
+            raise RuntimeError(f"OKX data client requires environment variables: {', '.join(missing)}")
+
+        builder.add_data_client(
+            OKX,
+            OKXDataClientFactory(),
+            OKXDataClientConfig(
+                instrument_types=(OKXInstrumentType.SPOT,),
+                http_timeout_secs=args.http_timeout_secs,
+                proxy_url=args.proxy_url,
+            ),
+        )
+
+    if BYBIT in venue_instruments:
+        builder.add_data_client(
+            BYBIT,
+            BybitDataClientFactory(),
+            BybitDataClientConfig(
+                product_types=(BybitProductType.SPOT,),
+                http_timeout_secs=args.http_timeout_secs,
+                proxy_url=args.proxy_url,
+            ),
+        )
+
+    if HYPERLIQUID in venue_instruments:
+        for value in venue_instruments[HYPERLIQUID]:
+            symbol = InstrumentId.from_str(value).symbol.value
+            if ":" in symbol:
+                raise ValueError(f"Hyperliquid HIP3 instruments are not exposed by the pyo3 adapter: {value}")
+            if not symbol.endswith("-SPOT") and not symbol.endswith("-PERP"):
+                raise ValueError(f"Unsupported Hyperliquid instrument format: {value}")
+
+        builder.add_data_client(
+            HYPERLIQUID,
+            HyperliquidDataClientFactory(),
+            HyperliquidDataClientConfig(
+                http_timeout_secs=args.http_timeout_secs,
+                proxy_url=args.proxy_url,
+            ),
+        )
+
+    node = builder.build()
+    for venue, venue_values in venue_instruments.items():
+        node.add_builtin_actor(
+            "DataTester",
+            DataTesterConfig(
+                actor_id=ActorId(f"DataTester-{venue}"),
+                instrument_ids=[InstrumentId.from_str(value) for value in venue_values],
+                client_id=ClientId(venue),
+                subscribe_quotes=venue != BYBIT,
+                subscribe_trades=True,
+                subscribe_book_deltas=True,
+                manage_book=True,
+                book_interval_ms=args.book_interval_ms,
+                log_data=args.log_data,
+            ),
+        )
     return node
-
-
-def stop_node(node: TradingNode, run_minutes: float) -> None:
-    print(f"Run time limit reached: {run_minutes:g} minutes. Stopping node...")
-    node.kernel.loop.call_soon_threadsafe(
-        lambda: node.kernel.loop.create_task(node.stop_async()),
-    )
-
 
 def parse_venue_instruments(values: list[str] | None) -> dict[str, list[str]]:
     if values is None:
@@ -189,123 +234,6 @@ def parse_venue_instruments(values: list[str] | None) -> dict[str, list[str]]:
 
     return venue_instruments
 
-
-def build_data_clients(
-    args: argparse.Namespace,
-    venue_instruments: dict[str, list[str]],
-) -> dict[str, Any]:
-    data_clients: dict[str, Any] = {}
-
-    if KRAKEN in venue_instruments:
-        data_clients[KRAKEN] = KrakenDataClientConfig(
-            instrument_provider=InstrumentProviderConfig(load_all=True),
-            http_timeout_secs=args.http_timeout_secs,
-            proxy_url=args.proxy_url,
-        )
-
-    if BINANCE in venue_instruments:
-        data_clients[BINANCE] = BinanceDataClientConfig(
-            account_type=BinanceAccountType.SPOT,
-            instrument_provider=InstrumentProviderConfig(
-                load_ids=frozenset(InstrumentId.from_str(value) for value in venue_instruments[BINANCE]),
-            ),
-            proxy_url=args.proxy_url,
-        )
-
-    if OKX in venue_instruments:
-        missing = [
-            name
-            for name in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
-            if not os.getenv(name)
-        ]
-        if missing:
-            raise RuntimeError(f"OKX data client requires environment variables: {', '.join(missing)}")
-
-        data_clients[OKX] = OKXDataClientConfig(
-            instrument_types=(OKXInstrumentType.SPOT,),
-            instrument_provider=InstrumentProviderConfig(
-                load_ids=frozenset(InstrumentId.from_str(value) for value in venue_instruments[OKX]),
-            ),
-            http_timeout_secs=args.http_timeout_secs,
-            proxy_url=args.proxy_url,
-        )
-
-    if BYBIT in venue_instruments:
-        data_clients[BYBIT] = BybitDataClientConfig(
-            product_types=(BybitProductType.SPOT,),
-            instrument_provider=InstrumentProviderConfig(
-                load_ids=frozenset(InstrumentId.from_str(value) for value in venue_instruments[BYBIT]),
-            ),
-            proxy_url=args.proxy_url,
-        )
-
-    if HYPERLIQUID in venue_instruments:
-        product_types, filters = build_hyperliquid_discovery(venue_instruments[HYPERLIQUID])
-        data_clients[HYPERLIQUID] = HyperliquidDataClientConfig(
-            product_types=product_types,
-            instrument_provider=InstrumentProviderConfig(
-                load_all=True,
-                filters=filters,
-            ),
-            http_timeout_secs=args.http_timeout_secs,
-            proxy_url=args.proxy_url,
-        )
-
-    return data_clients
-
-
-def build_hyperliquid_discovery(
-    instruments: list[str],
-) -> tuple[tuple[HyperliquidProductType, ...], dict[str, tuple[str, ...]]]:
-    product_types: set[HyperliquidProductType] = set()
-    market_types: set[str] = set()
-    bases: set[str] = set()
-
-    for value in instruments:
-        symbol = InstrumentId.from_str(value).symbol.value
-        bases.add(symbol.split("-")[0].upper())
-
-        if symbol.endswith("-SPOT"):
-            product_types.add(HyperliquidProductType.SPOT)
-            market_types.add("spot")
-        elif symbol.endswith("-PERP"):
-            product_types.add(HyperliquidProductType.PERP)
-            market_types.add("perp")
-        elif ":" in symbol:
-            product_types.add(HyperliquidProductType.PERP_HIP3)
-            market_types.add("perp_hip3")
-        else:
-            raise ValueError(f"Unsupported Hyperliquid instrument format: {value}")
-
-    return (
-        tuple(sorted(product_types, key=lambda product_type: product_type.value)),
-        {
-            "market_types": tuple(sorted(market_types)),
-            "bases": tuple(sorted(bases)),
-        },
-    )
-
-
-def build_data_tester_config(
-    args: argparse.Namespace,
-    venue: str,
-    instruments: list[str],
-) -> ImportableActorConfig:
-    return ImportableActorConfig(
-        actor_path="nautilus_trader.test_kit.strategies.tester_data:DataTester",
-        config_path="nautilus_trader.test_kit.strategies.tester_data:DataTesterConfig",
-        config={
-            "component_id": f"DataTester-{venue}",
-            "instrument_ids": instruments,
-            "client_id": venue,
-            "subscribe_quotes": venue != BYBIT,
-            "subscribe_trades": True,
-            "subscribe_book_deltas": True,
-            "manage_book": True,
-            "book_interval_ms": args.book_interval_ms,
-            "log_data": args.log_data,
-        },
-    )
 
 if __name__ == "__main__":
     main()
