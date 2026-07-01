@@ -54,7 +54,7 @@ def resolve_instruments(catalog: Path, requested: list[str] | None) -> list[str]
         return discover_instruments(catalog)
     except FileNotFoundError:
         deltas = {path.name for path in (catalog / "data" / "order_book_deltas").iterdir() if path.is_dir()}
-        trades = {path.name for path in (catalog / "data" / "trade_tick").iterdir() if path.is_dir()}
+        trades = {path.name for path in (catalog / "data" / "trades").iterdir() if path.is_dir()}
         instruments = sorted(deltas & trades)
         if not instruments:
             raise

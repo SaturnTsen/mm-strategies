@@ -5,18 +5,18 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
-from nautilus_trader.model.data import BookOrder
-from nautilus_trader.model.data import OrderBookDepth10
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model import BookOrder
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OrderBookDepth10
+from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.persistence import ParquetDataCatalog
 
 
 FIXED_SCALAR = 10**16
 DEPTH_LEVELS = 10
-DATA_TYPES = ("order_book_deltas", "quote_tick", "trade_tick")
+DATA_TYPES = ("order_book_deltas", "quotes", "trades")
 RECONSTRUCT_DATA_TYPE = "reconstruct"
 RECONSTRUCT_MATCH_MIN_RATIO = 0.90
 ACTION_ADD = 1
@@ -92,12 +92,13 @@ def load_nautilus_backtest_data(
     if book_data_type == "depth10":
         book_data = load_depth10_data(catalog_path, instrument, segment_key)
     elif book_data_type == "deltas":
-        query = {}
+        start_ns = None
+        end_ns = None
         if segment_key is not None:
             segment = segment_from_key(segment_key)
-            query["start"] = segment.start
-            query["end"] = segment.end
-        book_data = catalog.order_book_deltas([instrument], batched=True, **query)
+            start_ns = segment.start.value
+            end_ns = segment.end.value
+        book_data = catalog.query_order_book_deltas([instrument], start=start_ns, end=end_ns)
     else:
         raise ValueError("book_data_type must be depth10 or deltas")
 
@@ -113,7 +114,7 @@ def load_nautilus_backtest_data(
 
     start = pd.Timestamp(book_data[0].ts_event, unit="ns", tz="UTC")
     end = pd.Timestamp(book_data[-1].ts_event, unit="ns", tz="UTC")
-    trades = catalog.trade_ticks([instrument], start=start, end=end)
+    trades = catalog.query_trade_ticks([instrument], start=start.value, end=end.value)
     return book_data, trades, start, end
 
 
@@ -310,7 +311,7 @@ def load_deltas(catalog: Path, instrument: str, segment_key: str | None = None) 
 
 def load_quotes(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
     started = time.perf_counter()
-    quotes = _read_catalog_type(catalog, "quote_tick", instrument, segment_key)
+    quotes = _read_catalog_type(catalog, "quotes", instrument, segment_key)
     quotes["bid_price_f"] = decode_fixed_column(quotes["bid_price"], signed=True)
     quotes["ask_price_f"] = decode_fixed_column(quotes["ask_price"], signed=True)
     quotes["bid_size_f"] = decode_fixed_column(quotes["bid_size"], signed=False)
@@ -326,7 +327,7 @@ def load_quotes(catalog: Path, instrument: str, segment_key: str | None = None) 
 
 def load_trades(catalog: Path, instrument: str, segment_key: str | None = None) -> pd.DataFrame:
     started = time.perf_counter()
-    trades = _read_catalog_type(catalog, "trade_tick", instrument, segment_key)
+    trades = _read_catalog_type(catalog, "trades", instrument, segment_key)
     trades["price_f"] = decode_fixed_column(trades["price"], signed=True)
     trades["size_f"] = decode_fixed_column(trades["size"], signed=False)
     trades = add_datetime(trades)

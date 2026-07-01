@@ -33,7 +33,9 @@ from nautilus_trader.adapters.okx import (
     OKX,
     OKXDataClientConfig,
     OKXDataClientFactory,
+    OKXEnvironment,
     OKXInstrumentType,
+    OKXRegion,
 )
 from nautilus_trader.common import Environment, LoggerConfig, LogLevel
 from nautilus_trader.live import LiveNode, RotationConfig, StreamingConfig
@@ -156,18 +158,30 @@ def build_recording_node(
         )
 
     if OKX in venue_instruments:
-        missing = [
-            name
-            for name in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
-            if not os.getenv(name)
-        ]
+        okx_api_key = os.getenv("OKX_API_KEY")
+        okx_api_secret = os.getenv("OKX_API_SECRET")
+        okx_api_passphrase = os.getenv("OKX_API_PASSPHRASE")
+        okx_environment = os.getenv("OKX_ENVIRONMENT", "live")
+        okx_region = os.getenv("OKX_REGION", "global")
+        missing = []
+        if not okx_api_key:
+            missing.append("OKX_API_KEY")
+        if not okx_api_secret:
+            missing.append("OKX_API_SECRET")
+        if not okx_api_passphrase:
+            missing.append("OKX_API_PASSPHRASE")
         if missing:
-            raise RuntimeError(f"OKX data client requires environment variables: {', '.join(missing)}")
+            raise RuntimeError(f"OKX data client requires credentials: {', '.join(missing)}")
 
         builder.add_data_client(
             OKX,
             OKXDataClientFactory(),
             OKXDataClientConfig(
+                api_key=okx_api_key,
+                api_secret=okx_api_secret,
+                api_passphrase=okx_api_passphrase,
+                environment=OKXEnvironment.from_str(okx_environment),
+                region=OKXRegion.from_str(okx_region),
                 instrument_types=(OKXInstrumentType.SPOT,),
                 http_timeout_secs=args.http_timeout_secs,
                 proxy_url=args.proxy_url,

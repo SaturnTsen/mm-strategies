@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from datetime import datetime
@@ -13,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,25 +22,20 @@ from data_utils import (
     ACTION_CLEAR,
     ACTION_DELETE,
     ACTION_UPDATE,
-    CatalogSegment,
     DEPTH_LEVELS,
     SIDE_BUY,
     SIDE_SELL,
     load_deltas,
-    parse_catalog_file_segment,
     reconstructed_depths_path,
-    segments_overlap,
+    timestamp_key,
 )
-from nautilus_trader.model.data import OrderBookDeltas, QuoteTick, TradeTick
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from nautilus_trader.persistence.catalog.parquet import _timestamps_to_filename
 
 
 DEFAULT_CATALOG_PATH = Path("catalog")
-STREAMING_DATA_TYPES_BY_NAME = {
-    "quote_tick": QuoteTick,
-    "trade_tick": TradeTick,
-    "order_book_deltas": OrderBookDeltas,
+STREAMING_DATA_TYPES = ("order_book_deltas", "quotes", "trades")
+DATA_TYPE_ALIASES = {
+    "quote_tick": "quotes",
+    "trade_tick": "trades",
 }
 
 
@@ -50,11 +45,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG_PATH)
     parser.add_argument("--instance", default=None, help="Live instance UUID. Use latest to select the newest instance.")
-    parser.add_argument("--data-type", action="append", choices=sorted(STREAMING_DATA_TYPES_BY_NAME), default=None)
+    parser.add_argument("--data-type", action="append", choices=sorted((*STREAMING_DATA_TYPES, *DATA_TYPE_ALIASES)), default=None)
     parser.add_argument("-i", "--instrument", action="append", default=None)
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--overwrite-reconstruct", action="store_true")
     return parser.parse_args()
+
+
+def catalog_filename(start: int, end: int) -> str:
+    start_key = timestamp_key(pd.Timestamp(start, unit="ns", tz="UTC"))
+    end_key = timestamp_key(pd.Timestamp(end, unit="ns", tz="UTC"))
+    return f"{start_key}_{end_key}.parquet"
+
+
+def read_feather_table(path: Path) -> pa.Table:
+    with path.open("rb") as file:
+        return pa.ipc.open_stream(file).read_all()
+
+
+def normalize_stream_table(table: pa.Table) -> pa.Table:
+    if table.num_rows == 0:
+        return table
+    if "ts_init" not in table.schema.names:
+        raise ValueError("Feather table has no ts_init column")
+
+    ts_init = table.column("ts_init")
+    is_sorted = pc.all(pc.greater_equal(ts_init.slice(1), ts_init.slice(0, len(ts_init) - 1))).as_py() # type: ignore
+    if not is_sorted:
+        table = table.take(pc.sort_indices(table, sort_keys=[("ts_init", "ascending")])) # type: ignore
+    return table
+
+
+def write_stream_parquet(table: pa.Table, target_path: Path) -> None:
+    table = normalize_stream_table(table)
+    if table.num_rows == 0:
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(".tmp.parquet")
+    pq.write_table(table, tmp_path, row_group_size=5000)
+    tmp_path.replace(target_path)
 
 
 def feather_ts_init_bounds(path: Path) -> tuple[int, int]:
@@ -134,6 +164,8 @@ def reconstruct_depths(deltas: pd.DataFrame, label: str) -> pd.DataFrame:
             "_row": row["_row"],
             "source": "reconstructed_from_deltas",
         }
+        if "_segment_key" in row.index:
+            depth_row["_segment_key"] = row["_segment_key"]
         for level in range(DEPTH_LEVELS):
             bid_price, bid_size = bid_levels[level] if level < len(bid_levels) else (float("nan"), 0.0)
             ask_price, ask_size = ask_levels[level] if level < len(ask_levels) else (float("nan"), 0.0)
@@ -155,20 +187,34 @@ def reconstruct_depths(deltas: pd.DataFrame, label: str) -> pd.DataFrame:
     return result
 
 
+def load_instrument_delta_segments(catalog_path: Path, instrument: str, segment_keys: list[str]) -> pd.DataFrame:
+    frames = []
+    for segment_index, segment_key in enumerate(segment_keys):
+        frame = load_deltas(catalog_path, instrument, segment_key)
+        frame["_segment_key"] = segment_key
+        frame["_segment_index"] = segment_index
+        frames.append(frame)
+    if not frames:
+        raise ValueError(f"No delta segments selected for {instrument}")
+    return pd.concat(frames, ignore_index=True).sort_values(
+        ["ts_init", "_segment_index", "_file_index", "_row"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
 def main() -> None:
     args = parse_args()
+    data_types = None if args.data_type is None else {DATA_TYPE_ALIASES.get(value, value) for value in args.data_type}
     catalog_path = args.catalog.expanduser()
     live_path = catalog_path / "live"
     if not live_path.exists():
         raise FileNotFoundError(f"Live catalog directory does not exist: {live_path}")
 
     selections = []
-    for config_path in sorted(live_path.glob("*/config.json")):
-        instance_id = config_path.parent.name
-        with config_path.open() as file:
-            json.load(file)
-        for data_type in sorted(STREAMING_DATA_TYPES_BY_NAME):
-            data_type_path = config_path.parent / data_type
+    for instance_path in sorted(path for path in live_path.iterdir() if path.is_dir()):
+        instance_id = instance_path.name
+        for data_type in sorted(STREAMING_DATA_TYPES):
+            data_type_path = instance_path / data_type
             if not data_type_path.exists():
                 continue
             for instrument_path in sorted(path for path in data_type_path.iterdir() if path.is_dir()):
@@ -183,7 +229,7 @@ def main() -> None:
                         "paths": feather_paths,
                         "files": len(feather_paths),
                         "bytes": sum(path.stat().st_size for path in feather_paths),
-                        "config_mtime_ns": config_path.stat().st_mtime_ns,
+                        "instance_mtime_ns": instance_path.stat().st_mtime_ns,
                         "feather_mtime_ns": max(path.stat().st_mtime_ns for path in feather_paths),
                     },
                 )
@@ -204,15 +250,15 @@ def main() -> None:
     selected = selections
     if instance_id is not None:
         selected = [selection for selection in selected if selection["instance_id"] == instance_id]
-    if args.data_type is not None:
-        selected = [selection for selection in selected if selection["data_type"] in args.data_type]
+    if data_types is not None:
+        selected = [selection for selection in selected if selection["data_type"] in data_types]
     if args.instrument is not None:
         selected = [selection for selection in selected if selection["instrument"] in args.instrument]
     selected = sorted(
         selected,
         key=lambda selection: (
             selection["feather_mtime_ns"],
-            selection["config_mtime_ns"],
+            selection["instance_mtime_ns"],
             selection["instance_id"],
             selection["data_type"],
             selection["instrument"],
@@ -220,22 +266,17 @@ def main() -> None:
     )
 
     for selection in selected:
-        selection_segment = CatalogSegment(
-            pd.Timestamp(selection["config_mtime_ns"], unit="ns", tz="UTC"),
-            pd.Timestamp(selection["feather_mtime_ns"], unit="ns", tz="UTC"),
+        target_paths = []
+        for feather_path in selection["paths"]:
+            start, end = feather_ts_init_bounds(feather_path)
+            target_paths.append(catalog_path / "data" / selection["data_type"] / selection["instrument"] / catalog_filename(start, end))
+
+        parquet_done = sum(path.exists() for path in target_paths)
+        depth_done = (
+            sum(reconstructed_depths_path(catalog_path, selection["instrument"], path.stem).exists() for path in target_paths)
+            if selection["data_type"] == "order_book_deltas"
+            else 0
         )
-        parquet_files = [
-            path
-            for path in sorted((catalog_path / "data" / selection["data_type"] / selection["instrument"]).glob("*.parquet"))
-            if segments_overlap(parse_catalog_file_segment(path), selection_segment)
-        ]
-        depth_files = [
-            path
-            for path in sorted((catalog_path / "data" / "reconstruct" / selection["instrument"]).glob("*.parquet"))
-            if segments_overlap(parse_catalog_file_segment(path), selection_segment)
-        ]
-        parquet_done = min(len(parquet_files), selection["files"])
-        depth_done = min(len(depth_files), selection["files"]) if selection["data_type"] == "order_book_deltas" else 0
         selection["parquet_status"] = (
             "done"
             if parquet_done == selection["files"]
@@ -257,7 +298,7 @@ def main() -> None:
         header = (
             f"{'instance':36}  {'data_type':18}  {'instrument':28}  "
             f"{'parquet':>12}  {'depth':>12}  "
-            f"{'size':>10}  {'config_mtime':19}  {'feather_mtime':19}"
+            f"{'size':>10}  {'instance_mtime':19}  {'feather_mtime':19}"
         )
         print(header)
         print("-" * len(header))
@@ -276,7 +317,7 @@ def main() -> None:
                 f"{selection['parquet_status']:>12}  "
                 f"{selection['depth_status']:>12}  "
                 f"{size_text:>10}  "
-                f"{datetime.fromtimestamp(selection['config_mtime_ns'] / 1_000_000_000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S'):19}  "
+                f"{datetime.fromtimestamp(selection['instance_mtime_ns'] / 1_000_000_000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S'):19}  "
                 f"{datetime.fromtimestamp(selection['feather_mtime_ns'] / 1_000_000_000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S'):19}"
             )
     else:
@@ -287,14 +328,13 @@ def main() -> None:
     if not selected:
         raise FileNotFoundError("No matching live feather files")
 
-    catalog = ParquetDataCatalog(str(catalog_path))
     pending_conversions = []
     delta_segments = {}
     skipped_conversions = 0
     for selection in selected:
         for feather_path in selection["paths"]:
             start, end = feather_ts_init_bounds(feather_path)
-            target_path = catalog_path / "data" / selection["data_type"] / selection["instrument"] / _timestamps_to_filename(start, end)
+            target_path = catalog_path / "data" / selection["data_type"] / selection["instrument"] / catalog_filename(start, end)
             if selection["data_type"] == "order_book_deltas":
                 delta_segments[(selection["instrument"], target_path.stem)] = target_path
             if target_path.exists():
@@ -306,38 +346,39 @@ def main() -> None:
     print(f"conversion plan pending={len(pending_conversions)} skipped_existing={skipped_conversions}")
     for selection, feather_path, target_path in pending_conversions:
         print(f"convert {feather_path} -> {target_path}")
-        feather_table = catalog._read_feather_file(str(feather_path))
-        if feather_table is None:
-            raise RuntimeError(f"Cannot read feather file: {feather_path}")
-        catalog._convert_feather_table_to_parquet(
-            feather_table=feather_table,
-            feather_path=str(feather_path),
-            data_cls=STREAMING_DATA_TYPES_BY_NAME[selection["data_type"]],
-            used_catalog=catalog,
-        )
+        write_stream_parquet(read_feather_table(feather_path), target_path)
 
-    pending_reconstructs = []
+    pending_reconstructs_by_instrument = {}
+    delta_segments_by_instrument = {}
     skipped_reconstructs = 0
     for instrument, segment_key in sorted(delta_segments):
+        delta_segments_by_instrument.setdefault(instrument, []).append(segment_key)
         target_path = reconstructed_depths_path(catalog_path, instrument, segment_key)
         if target_path.exists() and not args.overwrite_reconstruct:
             skipped_reconstructs += 1
         else:
-            pending_reconstructs.append((instrument, segment_key, target_path))
+            pending_reconstructs_by_instrument.setdefault(instrument, []).append((segment_key, target_path))
 
     if not delta_segments:
         print("reconstruct plan pending=0 skipped_no_order_book_deltas")
         return
 
-    print(f"reconstruct plan pending={len(pending_reconstructs)} skipped_existing={skipped_reconstructs}")
-    for instrument, segment_key, target_path in pending_reconstructs:
-        print(f"reconstruct instrument={instrument} segment={segment_key}")
-        depths = reconstruct_depths(load_deltas(catalog_path, instrument, segment_key), f"{instrument} {segment_key}")
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target_path.with_suffix(".tmp.parquet")
-        print(f"write reconstructed depths rows={len(depths)} path={target_path}")
-        depths.to_parquet(tmp_path, index=False)
-        tmp_path.replace(target_path)
+    pending_count = sum(len(values) for values in pending_reconstructs_by_instrument.values())
+    print(f"reconstruct plan pending={pending_count} skipped_existing={skipped_reconstructs}")
+    for instrument, pending_reconstructs in sorted(pending_reconstructs_by_instrument.items()):
+        segment_keys = sorted(delta_segments_by_instrument[instrument])
+        print(f"reconstruct instrument={instrument} segments={len(segment_keys)}")
+        depths = reconstruct_depths(load_instrument_delta_segments(catalog_path, instrument, segment_keys), instrument)
+        depth_groups = {segment_key: frame.drop(columns=["_segment_key", "_segment_index"], errors="ignore") for segment_key, frame in depths.groupby("_segment_key", sort=False)}
+        for segment_key, target_path in pending_reconstructs:
+            if segment_key not in depth_groups:
+                raise ValueError(f"No valid depth snapshots reconstructed for {instrument} segment={segment_key}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = target_path.with_suffix(".tmp.parquet")
+            segment_depths = depth_groups[segment_key].reset_index(drop=True)
+            print(f"write reconstructed depths rows={len(segment_depths)} path={target_path}")
+            segment_depths.to_parquet(tmp_path, index=False)
+            tmp_path.replace(target_path)
 
 
 if __name__ == "__main__":
